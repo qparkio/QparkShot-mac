@@ -1,0 +1,54 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+
+# Xcode build output
+build/
+DerivedData/
+*.xcresult
+*.xctestrun
+*.xcuserstate
+*.xcscmblueprint
+*.dSYM/
+
+# Xcode user-specific state (keep shared schemes under xcshareddata/)
+xcuserdata/
+*.xcuserdatad
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Archives / artifacts
+*.xcarchive
+*.app
+*.dmg
+*.pkg
+*.ipa
+
+# Local helper scripts
+scripts/
+
+# Local documentation pages and QA notes
+docs/
+
+# Local tests are excluded from the minimal public app build set
+Tests/
+
+# IDE
+.idea/
+.vscode/
+
+# Signing material and local credentials
+.env
+.env.*
+!.env.example
+*.cer
+*.developerprofile
+*.key
+*.mobileprovision
+*.p12
+*.pem
+*.provisionprofile
