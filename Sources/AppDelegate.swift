@@ -121,7 +121,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let captureItem = NSMenuItem(title: "Capture Selected Area...", action: #selector(triggerCaptureAction), keyEquivalent: "c")
     captureItem.keyEquivalentModifierMask = [.command, .shift]
     menu.addItem(captureItem)
-    
+
+    let fullScreenItem = NSMenuItem(title: "Capture Full Screen", action: #selector(triggerFullScreenCaptureAction), keyEquivalent: "")
+    menu.addItem(fullScreenItem)
+
+    let delayItem = NSMenuItem(title: "Capture with Delay", action: nil, keyEquivalent: "")
+    let delayMenu = NSMenu()
+    for seconds in [3, 5, 10] {
+      let item = NSMenuItem(
+        title: "\(seconds) seconds",
+        action: #selector(triggerDelayedCaptureAction(_:)),
+        keyEquivalent: ""
+      )
+      item.tag = seconds
+      delayMenu.addItem(item)
+    }
+    delayItem.submenu = delayMenu
+    menu.addItem(delayItem)
+
+    menu.addItem(NSMenuItem.separator())
+
     let galleryItem = NSMenuItem(title: "Open Gallery", action: #selector(showGalleryAction), keyEquivalent: "g")
     galleryItem.keyEquivalentModifierMask = [.command]
     menu.addItem(galleryItem)
@@ -144,6 +163,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   
   @objc func triggerCaptureAction(_ sender: Any?) {
     triggerCaptureFlow()
+  }
+
+  @objc func triggerFullScreenCaptureAction(_ sender: Any?) {
+    triggerCaptureFlow(modeOverride: "fullScreen")
+  }
+
+  @objc func triggerDelayedCaptureAction(_ sender: Any?) {
+    let seconds = (sender as? NSMenuItem)?.tag ?? 3
+    triggerCaptureFlow(delayOverride: seconds)
   }
   
   @objc func showGalleryAction(_ sender: Any?) {
@@ -169,8 +197,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     focusMainWindow(preferredContentSize: CGSize(width: 760, height: 520))
   }
   
-  func openEditor(for imagePath: String) {
-    MainWindowNavigation.shared.openEditor(imagePath)
+  func openEditor(forPath imagePath: String) {
+    let item = ShotQueueStore.shared.enqueue(path: imagePath)
+    openEditor(itemID: item.id)
+  }
+
+  func openEditor(itemID: UUID) {
+    MainWindowNavigation.shared.openEditor(itemID: itemID)
     focusMainWindow(preferredContentSize: CGSize(width: 900, height: 650))
   }
   
@@ -237,11 +270,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
   
   // MARK: - Capture Flow
-  func triggerCaptureFlow() {
+  /// Triggers a capture. Pass `modeOverride` / `delayOverride` for one-shot menu actions
+  /// without mutating saved settings.
+  func triggerCaptureFlow(modeOverride: String? = nil, delayOverride: Int? = nil) {
     guard CGPreflightScreenCaptureAccess() else {
       let req = CGRequestScreenCaptureAccess()
       writeDebugLog("Request screen capture access returned: \(req)")
-      
+
       // Attempt legacy prompt or Settings redirection if repeat request
       if #available(macOS 12.3, *) {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] _, _ in
@@ -260,30 +295,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       }
       return
     }
-    
+
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("qpark-shot-\(UUID().uuidString)")
       .appendingPathExtension("png")
-    
+
     let mainWindowWasVisible = galleryWindow?.isVisible ?? false
-    
+
     galleryWindow?.orderOut(nil)
-    
+
+    let store = SettingsStore.shared
+    let mode = modeOverride ?? store.captureMode
+    let delaySeconds = max(0, delayOverride ?? store.captureDelaySeconds)
+
+    var arguments: [String] = []
+    switch mode {
+    case "fullScreen":
+      arguments.append("-m") // capture only the main display
+    default:
+      arguments.append("-i") // interactive selection (default)
+    }
+    if delaySeconds > 0 {
+      arguments.append("-T")
+      arguments.append(String(delaySeconds))
+    }
+    arguments.append(url.path)
+
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self = self else { return }
-      
+
       Thread.sleep(forTimeInterval: 0.25)
-      
+
       let process = Process()
       process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-      process.arguments = ["-i", url.path]
-      
+      process.arguments = arguments
+
       do {
         try process.run()
         process.waitUntilExit()
-        
+
         let fileExists = FileManager.default.fileExists(atPath: url.path)
-        
+
         DispatchQueue.main.async {
           if !fileExists {
             if mainWindowWasVisible {
@@ -292,8 +344,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return
           }
-          
-          self.openEditor(for: url.path)
+
+          self.openEditor(forPath: url.path)
         }
       } catch {
         self.writeDebugLog("Screencapture run error: \(error.localizedDescription)")
@@ -316,18 +368,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   // MARK: - Carbon Global Hotkey Handling
   func syncHotkeySettings() {
     unregisterAllGlobalShortcuts()
-    
+
     let key = "flutter.qpark_shot.app_settings.v1"
     guard let jsonString = UserDefaults.standard.string(forKey: key),
           let data = jsonString.data(using: .utf8),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let hotkey = json["hotkey"] as? [String: Any],
-          let enabled = hotkey["enabled"] as? Bool, enabled,
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return
+    }
+
+    let handlerStatus = ensureHotkeyEventHandlerInstalled()
+    guard handlerStatus == noErr else { return }
+
+    // Selection (interactive) capture hotkey
+    if let hotkey = json["hotkey"] as? [String: Any] {
+      registerHotkey(from: hotkey, id: "captureSelection")
+    }
+
+    // Full-screen capture hotkey
+    if let fsHotkey = json["fullScreenHotkey"] as? [String: Any] {
+      registerHotkey(from: fsHotkey, id: "captureFullScreen")
+    }
+  }
+
+  private func registerHotkey(from hotkey: [String: Any], id: String) {
+    guard let enabled = hotkey["enabled"] as? Bool, enabled,
           let keyChar = hotkey["key"] as? String, !keyChar.isEmpty,
           let keyCode = keyCode(for: keyChar) else {
-        return
-      }
-    
+      return
+    }
+
     var modifiers: UInt32 = 0
     if let modifierList = hotkey["modifiers"] as? [String] {
       for modifierName in modifierList {
@@ -345,14 +414,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
       }
     }
-    
-    let handlerStatus = ensureHotkeyEventHandlerInstalled()
-    guard handlerStatus == noErr else { return }
-    
+
     let carbonID = nextAvailableHotKeyID()
     let hotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: carbonID)
     var hotKeyRef: EventHotKeyRef?
-    
+
     let status = RegisterEventHotKey(
       keyCode,
       modifiers,
@@ -360,9 +426,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       GetApplicationEventTarget(),
       OptionBits(0),
       &hotKeyRef)
-      
+
     if status == noErr, let hotKeyRef = hotKeyRef {
-      let id = "captureDesktop"
       registeredGlobalShortcuts[id] = RegisteredGlobalShortcut(
         id: id,
         carbonID: carbonID,
@@ -412,13 +477,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     
     guard hotKeyID.signature == Self.hotKeySignature,
-          let _ = shortcutIDsByCarbonID[hotKeyID.id]
+          let shortcutID = shortcutIDsByCarbonID[hotKeyID.id]
     else {
       return OSStatus(eventNotHandledErr)
     }
-    
+
     DispatchQueue.main.async { [weak self] in
-      self?.triggerCaptureFlow()
+      switch shortcutID {
+      case "captureFullScreen":
+        self?.triggerCaptureFlow(modeOverride: "fullScreen")
+      default:
+        self?.triggerCaptureFlow(modeOverride: "selection")
+      }
     }
     return noErr
   }

@@ -6,27 +6,27 @@ import ImageIO
 enum MainWindowDestination: Equatable {
   case gallery
   case settings
-  case editor(String)
+  case editor(UUID)
 }
 
 final class MainWindowNavigation: ObservableObject {
   static let shared = MainWindowNavigation()
-  
+
   @Published private(set) var destination: MainWindowDestination = .gallery
-  
+
   private init() {}
-  
+
   func showGallery() {
     destination = .gallery
   }
-  
+
   func showSettings() {
     SettingsStore.shared.load()
     destination = .settings
   }
-  
-  func openEditor(_ imagePath: String) {
-    destination = .editor(imagePath)
+
+  func openEditor(itemID: UUID) {
+    destination = .editor(itemID)
   }
 }
 
@@ -95,9 +95,9 @@ struct MainWindowView: View {
       SettingsView(store: SettingsStore.shared) {
         navigation.showGallery()
       }
-    case .editor(let imagePath):
+    case .editor(let itemID):
       EditorView(
-        imagePath: imagePath,
+        itemID: itemID,
         onClose: {
           navigation.showGallery()
         },
@@ -111,6 +111,7 @@ struct MainWindowView: View {
           }
         }
       )
+      .id(itemID)
     }
   }
 }
@@ -183,7 +184,7 @@ struct MainGalleryView: View {
                 path: path,
                 thumbnail: thumbnails[path],
                 onLoad: { loadThumbnailIfNeeded(path: path) },
-                onOpen: { AppDelegate.shared.openEditor(for: path) },
+                onOpen: { AppDelegate.shared.openEditor(forPath: path) },
                 onCopy: { copyToClipboard(path: path) },
                 onShare: { shareImage(path: path) },
                 onDelete: { deleteImage(path: path) }
@@ -402,7 +403,20 @@ struct ScreenshotGridItem: View {
       .onAppear(perform: onLoad)
       .onHover { isHovered = $0 }
       .onTapGesture(perform: onOpen)
-      
+      .onDrag {
+        let provider = NSItemProvider()
+        provider.suggestedName = url.lastPathComponent
+        provider.registerFileRepresentation(
+          forTypeIdentifier: "public.png",
+          fileOptions: [],
+          visibility: .all
+        ) { completion in
+          completion(url, true, nil)
+          return nil
+        }
+        return provider
+      }
+
       Text(url.lastPathComponent)
         .font(.system(size: 10))
         .foregroundColor(.secondary)
@@ -490,6 +504,18 @@ class SettingsStore: ObservableObject {
   @Published var cleanupIncludeSaved: Bool = false
   @Published var cleanupDurationHours: Double = 24
   @Published var saveDirectory: String = ""
+
+  // Shot queue (buffer) sidebar in editor
+  @Published var queuePanelEnabled: Bool = true
+
+  // Capture modes
+  @Published var captureMode: String = "selection"        // "selection" | "fullScreen"
+  @Published var captureDelaySeconds: Int = 0             // 0 / 3 / 5 / 10
+
+  // Full-screen capture hotkey (independent from selection hotkey)
+  @Published var fullScreenHotkeyEnabled: Bool = false
+  @Published var fullScreenHotkeyKey: String = "F"
+  @Published var fullScreenHotkeyModifiers: [String] = ["command", "shift"]
   
   var preferredColorScheme: ColorScheme? {
     switch themePreference {
@@ -558,6 +584,22 @@ class SettingsStore: ObservableObject {
       }
       self.saveDirectory = cleanup["saveDirectory"] as? String ?? ""
     }
+    if let queue = json["queue"] as? [String: Any] {
+      self.queuePanelEnabled = queue["panelEnabled"] as? Bool ?? true
+    }
+    if let capture = json["capture"] as? [String: Any] {
+      self.captureMode = capture["mode"] as? String ?? "selection"
+      if let delay = capture["delaySeconds"] as? Int {
+        self.captureDelaySeconds = delay
+      } else if let delayDouble = capture["delaySeconds"] as? Double {
+        self.captureDelaySeconds = Int(delayDouble)
+      }
+    }
+    if let fsHotkey = json["fullScreenHotkey"] as? [String: Any] {
+      self.fullScreenHotkeyEnabled = fsHotkey["enabled"] as? Bool ?? false
+      self.fullScreenHotkeyKey = fsHotkey["key"] as? String ?? "F"
+      self.fullScreenHotkeyModifiers = fsHotkey["modifiers"] as? [String] ?? ["command", "shift"]
+    }
   }
 
   func save() {
@@ -592,6 +634,18 @@ class SettingsStore: ObservableObject {
         "includeSavedFiles": cleanupIncludeSaved,
         "durationSeconds": cleanupDurationHours * 3600.0,
         "saveDirectory": saveDirectory
+      ],
+      "queue": [
+        "panelEnabled": queuePanelEnabled
+      ],
+      "capture": [
+        "mode": captureMode,
+        "delaySeconds": captureDelaySeconds
+      ],
+      "fullScreenHotkey": [
+        "enabled": fullScreenHotkeyEnabled,
+        "key": fullScreenHotkeyKey,
+        "modifiers": fullScreenHotkeyModifiers
       ]
     ]
     if let data = try? JSONSerialization.data(withJSONObject: json, options: []),
@@ -603,6 +657,77 @@ class SettingsStore: ObservableObject {
     // Notify AppDelegate to re-register hotkey
     AppDelegate.shared.syncHotkeySettings()
     AppDelegate.shared.applyThemePreference()
+  }
+}
+
+// MARK: - Shot Queue Store
+
+struct ShotQueueItem: Identifiable, Equatable {
+  let id: UUID
+  let path: String
+  let capturedAt: Date
+}
+
+final class ShotQueueStore: ObservableObject {
+  static let shared = ShotQueueStore()
+
+  @Published private(set) var items: [ShotQueueItem] = []
+  @Published var activeID: UUID? = nil
+
+  private init() {}
+
+  /// Append a captured shot to the queue and mark it active. Returns the created item.
+  @discardableResult
+  func enqueue(path: String, capturedAt: Date = Date()) -> ShotQueueItem {
+    if let existing = items.first(where: { $0.path == path }) {
+      activeID = existing.id
+      return existing
+    }
+    let item = ShotQueueItem(id: UUID(), path: path, capturedAt: capturedAt)
+    items.append(item)
+    activeID = item.id
+    return item
+  }
+
+  func item(for id: UUID) -> ShotQueueItem? {
+    items.first { $0.id == id }
+  }
+
+  func item(forPath path: String) -> ShotQueueItem? {
+    items.first { $0.path == path }
+  }
+
+  /// Remove an item. If it was active, advance activeID to the next neighbour (or nil).
+  /// Returns the new active id (or nil if queue is now empty).
+  @discardableResult
+  func remove(_ id: UUID) -> UUID? {
+    guard let index = items.firstIndex(where: { $0.id == id }) else { return activeID }
+    let removed = items.remove(at: index)
+
+    let tempPrefix = FileManager.default.temporaryDirectory.path
+    if removed.path.hasPrefix(tempPrefix) {
+      try? FileManager.default.removeItem(atPath: removed.path)
+    }
+
+    if activeID == id {
+      if items.isEmpty {
+        activeID = nil
+      } else {
+        let nextIndex = min(index, items.count - 1)
+        activeID = items[nextIndex].id
+      }
+    }
+    return activeID
+  }
+
+  /// Wipe the entire queue and delete any temp PNGs it owned.
+  func clearAll() {
+    let tempPrefix = FileManager.default.temporaryDirectory.path
+    for item in items where item.path.hasPrefix(tempPrefix) {
+      try? FileManager.default.removeItem(atPath: item.path)
+    }
+    items.removeAll()
+    activeID = nil
   }
 }
 
@@ -828,7 +953,7 @@ struct SettingsView: View {
         
         // App header
         HStack(spacing: 10) {
-          Image(systemName: "camera.viewfinder.circle.fill")
+          Image(systemName: "viewfinder.circle.fill")
             .font(.system(size: 26))
             .foregroundColor(.accentColor)
           VStack(alignment: .leading, spacing: 1) {
@@ -849,7 +974,8 @@ struct SettingsView: View {
           sidebarButton(index: 1, label: "Hotkeys", icon: "keyboard", color: .blue)
           sidebarButton(index: 2, label: "Watermark", icon: "signature", color: .purple)
           sidebarButton(index: 3, label: "Storage", icon: "folder.fill", color: .orange)
-          sidebarButton(index: 4, label: "About", icon: "info.circle.fill", color: .gray)
+          sidebarButton(index: 4, label: "Buffer", icon: "tray.full", color: .pink)
+          sidebarButton(index: 5, label: "About", icon: "info.circle.fill", color: .gray)
         }
         .padding(.horizontal, 8)
         
@@ -872,6 +998,8 @@ struct SettingsView: View {
             watermarkTab
           case 3:
             storageTab
+          case 4:
+            queueTab
           default:
             aboutTab
           }
@@ -1048,9 +1176,172 @@ struct SettingsView: View {
           .font(.system(size: 11))
         }
       }
+
+      // Full-screen capture hotkey
+      SettingsCard {
+        Toggle("Enable Full-Screen Capture Hotkey", isOn: Binding(
+          get: { store.fullScreenHotkeyEnabled },
+          set: { store.fullScreenHotkeyEnabled = $0; store.save() }
+        ))
+        .toggleStyle(.switch)
+        .font(.system(size: 12, weight: .semibold))
+
+        if store.fullScreenHotkeyEnabled {
+          Divider()
+
+          HStack(spacing: 8) {
+            Text("Shortcut:")
+              .font(.system(size: 12))
+
+            Toggle("Cmd", isOn: Binding(
+              get: { store.fullScreenHotkeyModifiers.contains("command") },
+              set: { on in
+                if on {
+                  if !store.fullScreenHotkeyModifiers.contains("command") { store.fullScreenHotkeyModifiers.append("command") }
+                } else {
+                  store.fullScreenHotkeyModifiers.removeAll { $0 == "command" }
+                }
+                store.save()
+              }
+            ))
+            .toggleStyle(.checkbox)
+
+            Toggle("Shift", isOn: Binding(
+              get: { store.fullScreenHotkeyModifiers.contains("shift") },
+              set: { on in
+                if on {
+                  if !store.fullScreenHotkeyModifiers.contains("shift") { store.fullScreenHotkeyModifiers.append("shift") }
+                } else {
+                  store.fullScreenHotkeyModifiers.removeAll { $0 == "shift" }
+                }
+                store.save()
+              }
+            ))
+            .toggleStyle(.checkbox)
+
+            Toggle("Option", isOn: Binding(
+              get: { store.fullScreenHotkeyModifiers.contains("option") },
+              set: { on in
+                if on {
+                  if !store.fullScreenHotkeyModifiers.contains("option") { store.fullScreenHotkeyModifiers.append("option") }
+                } else {
+                  store.fullScreenHotkeyModifiers.removeAll { $0 == "option" }
+                }
+                store.save()
+              }
+            ))
+            .toggleStyle(.checkbox)
+
+            Toggle("Ctrl", isOn: Binding(
+              get: { store.fullScreenHotkeyModifiers.contains("control") },
+              set: { on in
+                if on {
+                  if !store.fullScreenHotkeyModifiers.contains("control") { store.fullScreenHotkeyModifiers.append("control") }
+                } else {
+                  store.fullScreenHotkeyModifiers.removeAll { $0 == "control" }
+                }
+                store.save()
+              }
+            ))
+            .toggleStyle(.checkbox)
+
+            TextField("Key", text: Binding(
+              get: { store.fullScreenHotkeyKey },
+              set: {
+                let cleaned = String($0.prefix(1)).uppercased()
+                store.fullScreenHotkeyKey = cleaned
+                store.save()
+              }
+            ))
+            .frame(width: 40)
+            .textFieldStyle(.roundedBorder)
+            .multilineTextAlignment(.center)
+          }
+          .font(.system(size: 11))
+        }
+      }
+
+      // Capture mode + delay
+      SettingsCard {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Capture Mode")
+            .font(.system(size: 12, weight: .semibold))
+
+          Picker("", selection: Binding(
+            get: { store.captureMode },
+            set: { store.captureMode = $0; store.save() }
+          )) {
+            Text("Selection").tag("selection")
+            Text("Full Screen").tag("fullScreen")
+          }
+          .pickerStyle(.segmented)
+          .labelsHidden()
+
+          Divider()
+
+          HStack {
+            Text("Default Delay:")
+              .font(.system(size: 12))
+            Spacer()
+            Picker("", selection: Binding(
+              get: { store.captureDelaySeconds },
+              set: { store.captureDelaySeconds = $0; store.save() }
+            )) {
+              Text("None").tag(0)
+              Text("3 s").tag(3)
+              Text("5 s").tag(5)
+              Text("10 s").tag(10)
+            }
+            .pickerStyle(.menu)
+            .frame(width: 100)
+          }
+          Text("Delay applies to hotkey-triggered captures. The status-bar menu also provides one-shot delay options.")
+            .font(.system(size: 10))
+            .foregroundColor(.secondary)
+        }
+      }
     }
   }
-  
+
+  private var queueTab: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      sectionHeader(title: "Shot Buffer", icon: "tray.full", color: .pink)
+
+      SettingsCard {
+        VStack(alignment: .leading, spacing: 8) {
+          Toggle("Show buffer panel in editor", isOn: Binding(
+            get: { store.queuePanelEnabled },
+            set: { store.queuePanelEnabled = $0; store.save() }
+          ))
+          .toggleStyle(.switch)
+          .font(.system(size: 12, weight: .semibold))
+
+          Text("Keeps every screenshot you take in a vertical carousel on the left side of the editor. Click any item to switch, hover for preview-with-watermark and remove-from-buffer actions. The buffer lives only for the current session and is wiped on app restart.")
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+
+      SettingsCard {
+        HStack {
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Current buffer")
+              .font(.system(size: 12, weight: .semibold))
+            Text("\(ShotQueueStore.shared.items.count) screenshot(s) in memory")
+              .font(.system(size: 11))
+              .foregroundColor(.secondary)
+          }
+          Spacer()
+          Button("Clear buffer") {
+            ShotQueueStore.shared.clearAll()
+          }
+          .disabled(ShotQueueStore.shared.items.isEmpty)
+        }
+      }
+    }
+  }
+
   private var watermarkTab: some View {
     VStack(alignment: .leading, spacing: 12) {
       sectionHeader(title: "Watermark Settings", icon: "signature", color: .purple)
@@ -1330,14 +1621,14 @@ struct SettingsView: View {
       SettingsCard {
         VStack(alignment: .center, spacing: 10) {
           Spacer().frame(height: 6)
-          Image(systemName: "camera.viewfinder.circle.fill")
+          Image(systemName: "viewfinder.circle.fill")
             .font(.system(size: 54))
             .foregroundColor(.accentColor)
           
           Text("QPARK Shot")
             .font(.system(size: 18, weight: .bold))
           
-          Text("Version 1.0.0")
+          Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0")")
             .font(.system(size: 11))
             .foregroundColor(.secondary)
           
@@ -1364,17 +1655,290 @@ struct SettingsView: View {
   }
 }
 
+// MARK: - Shot Queue Sidebar
+
+struct ShotQueueSidebar: View {
+  @ObservedObject private var queue = ShotQueueStore.shared
+  @ObservedObject private var settings = SettingsStore.shared
+  @State private var thumbnails: [UUID: NSImage] = [:]
+  @State private var pendingThumbnails: Set<UUID> = []
+  @State private var queuePreviewItem: ShotQueueItem? = nil
+  @State private var queuePreviewImage: NSImage? = nil
+  @State private var queuePreviewError: String? = nil
+  @State private var queuePreviewIsRendering = false
+  @State private var queuePreviewRequestID = UUID()
+
+  var body: some View {
+    VStack(spacing: 0) {
+      // Header
+      HStack(spacing: 6) {
+        Image(systemName: "tray.full")
+          .font(.system(size: 11, weight: .semibold))
+          .foregroundColor(.accentColor)
+        Text("Buffer · \(queue.items.count)")
+          .font(.system(size: 11, weight: .semibold))
+        Spacer()
+        if !queue.items.isEmpty {
+          Button(action: clearAllWithConfirm) {
+            Image(systemName: "trash")
+              .font(.system(size: 10, weight: .semibold))
+          }
+          .buttonStyle(.plain)
+          .help("Clear buffer")
+        }
+      }
+      .padding(.horizontal, 10)
+      .padding(.vertical, 8)
+
+      Divider()
+
+      // Carousel
+      ScrollView {
+        LazyVStack(spacing: 8) {
+          ForEach(queue.items) { item in
+            ShotQueueThumbnail(
+              item: item,
+              isActive: item.id == queue.activeID,
+              thumbnail: thumbnails[item.id],
+              canPreviewWatermark: settings.watermarkTextEnabled || settings.watermarkLogoEnabled,
+              onLoad: { loadThumbnailIfNeeded(item: item) },
+              onOpen: {
+                MainWindowNavigation.shared.openEditor(itemID: item.id)
+                queue.activeID = item.id
+              },
+              onPreviewWatermark: { renderWatermarkPreview(item: item) },
+              onDelete: { delete(item: item) }
+            )
+          }
+        }
+        .padding(8)
+      }
+    }
+    .frame(maxHeight: .infinity)
+    .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
+    .overlay {
+      if queuePreviewItem != nil {
+        ExportPreviewOverlay(
+          image: queuePreviewImage,
+          isRendering: queuePreviewIsRendering,
+          errorMessage: queuePreviewError,
+          onClose: closeWatermarkPreview
+        )
+        .transition(.opacity)
+      }
+    }
+  }
+
+  private func loadThumbnailIfNeeded(item: ShotQueueItem) {
+    guard thumbnails[item.id] == nil, !pendingThumbnails.contains(item.id) else { return }
+    pendingThumbnails.insert(item.id)
+    let path = item.path
+    let id = item.id
+    DispatchQueue.global(qos: .utility).async {
+      let thumb = makeThumbnailImage(path: path, maxPixelSize: 240)
+      DispatchQueue.main.async {
+        pendingThumbnails.remove(id)
+        guard queue.item(for: id) != nil else { return }
+        if let thumb {
+          thumbnails[id] = thumb
+        }
+      }
+    }
+  }
+
+  private func delete(item: ShotQueueItem) {
+    let wasActive = (item.id == queue.activeID)
+    let nextID = queue.remove(item.id)
+    thumbnails.removeValue(forKey: item.id)
+    pendingThumbnails.remove(item.id)
+    if wasActive {
+      if let nextID {
+        MainWindowNavigation.shared.openEditor(itemID: nextID)
+      } else {
+        MainWindowNavigation.shared.showGallery()
+      }
+    }
+  }
+
+  private func clearAllWithConfirm() {
+    let alert = NSAlert()
+    alert.messageText = "Clear screenshot buffer?"
+    alert.informativeText = "All \(queue.items.count) screenshots will be removed from the buffer. Files saved to your Pictures folder are not affected."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Clear")
+    alert.addButton(withTitle: "Cancel")
+    if alert.runModal() == .alertFirstButtonReturn {
+      queue.clearAll()
+      thumbnails.removeAll()
+      pendingThumbnails.removeAll()
+      MainWindowNavigation.shared.showGallery()
+    }
+  }
+
+  private func renderWatermarkPreview(item: ShotQueueItem) {
+    let requestID = UUID()
+    queuePreviewRequestID = requestID
+    queuePreviewItem = item
+    queuePreviewImage = nil
+    queuePreviewError = nil
+    queuePreviewIsRendering = true
+
+    let path = item.path
+    let watermarkSnapshot = WatermarkRenderSettings.current()
+    DispatchQueue.global(qos: .userInitiated).async {
+      let rendered: NSImage?
+      if let img = loadImageForRendering(path: path) {
+        rendered = renderAnnotatedImage(
+          image: img,
+          annotations: [],
+          cropRect: nil,
+          watermark: watermarkSnapshot
+        )
+      } else {
+        rendered = nil
+      }
+      DispatchQueue.main.async {
+        guard queuePreviewRequestID == requestID else { return }
+        queuePreviewIsRendering = false
+        if let rendered {
+          queuePreviewImage = rendered
+        } else {
+          queuePreviewError = "Could not render preview."
+        }
+      }
+    }
+  }
+
+  private func closeWatermarkPreview() {
+    queuePreviewRequestID = UUID()
+    queuePreviewIsRendering = false
+    queuePreviewItem = nil
+    queuePreviewImage = nil
+  }
+}
+
+struct ShotQueueThumbnail: View {
+  let item: ShotQueueItem
+  let isActive: Bool
+  let thumbnail: NSImage?
+  let canPreviewWatermark: Bool
+  let onLoad: () -> Void
+  let onOpen: () -> Void
+  let onPreviewWatermark: () -> Void
+  let onDelete: () -> Void
+
+  @State private var isHovered = false
+
+  private static let timeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss"
+    return f
+  }()
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      ZStack(alignment: .topTrailing) {
+        Group {
+          if let thumbnail {
+            Image(nsImage: thumbnail)
+              .resizable()
+              .aspectRatio(contentMode: .fill)
+          } else {
+            ZStack {
+              Color.gray.opacity(0.28)
+              ProgressView().controlSize(.small)
+            }
+          }
+        }
+        .frame(width: 104, height: 66)
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay(
+          RoundedRectangle(cornerRadius: 5)
+            .stroke(isActive ? Color.accentColor : Color.white.opacity(0.06),
+                    lineWidth: isActive ? 2 : 1)
+        )
+
+        if isHovered {
+          Color.black.opacity(0.32)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+
+          HStack(spacing: 4) {
+            if canPreviewWatermark {
+              Button(action: onPreviewWatermark) {
+                Image(systemName: "eye")
+                  .font(.system(size: 9, weight: .bold))
+                  .foregroundColor(.white)
+                  .padding(4)
+                  .background(Color.black.opacity(0.55))
+                  .clipShape(Circle())
+              }
+              .buttonStyle(.plain)
+              .help("Preview with watermark")
+            }
+
+            Button(action: onDelete) {
+              Image(systemName: "trash")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.white)
+                .padding(4)
+                .background(Color.red)
+                .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Remove from buffer")
+          }
+          .padding(4)
+        }
+      }
+      .onAppear(perform: onLoad)
+      .onHover { isHovered = $0 }
+      .onTapGesture(perform: onOpen)
+      .onDrag {
+        let url = URL(fileURLWithPath: item.path)
+        let provider = NSItemProvider()
+        provider.suggestedName = url.lastPathComponent
+        provider.registerFileRepresentation(
+          forTypeIdentifier: "public.png",
+          fileOptions: [],
+          visibility: .all
+        ) { completion in
+          completion(url, true, nil)
+          return nil
+        }
+        return provider
+      }
+      .contextMenu {
+        Button("Open", action: onOpen)
+        if canPreviewWatermark {
+          Button("Preview with watermark", action: onPreviewWatermark)
+        }
+        Divider()
+        Button("Remove from buffer", role: .destructive, action: onDelete)
+      }
+
+      Text(Self.timeFormatter.string(from: item.capturedAt))
+        .font(.system(size: 9))
+        .foregroundColor(.secondary)
+        .frame(width: 104, alignment: .leading)
+    }
+  }
+}
+
 // MARK: - Editor View
 struct EditorView: View {
-  let imagePath: String
+  let itemID: UUID
   var onClose: () -> Void = {}
   var onSave: () -> Void
-  
+
+  @ObservedObject private var queue = ShotQueueStore.shared
+  @ObservedObject private var settings = SettingsStore.shared
+
   @State private var image: NSImage? = nil
   @State private var annotations: [Annotation] = []
   @State private var undoStack: [[Annotation]] = []
   @State private var redoStack: [[Annotation]] = []
-  
+
   @State private var tool: ToolType = .freehand
   @State private var color: Color = .red
   @State private var strokeWidth: CGFloat = 4.0
@@ -1388,8 +1952,26 @@ struct EditorView: View {
   @State private var imageLoadRequestID = UUID()
   @State private var exportRequestID = UUID()
   @State private var isExporting = false
+
+  private var imagePath: String {
+    queue.item(for: itemID)?.path ?? ""
+  }
   
   var body: some View {
+    HStack(spacing: 0) {
+      if settings.queuePanelEnabled && !queue.items.isEmpty {
+        ShotQueueSidebar()
+          .frame(width: 124)
+          .transition(.move(edge: .leading).combined(with: .opacity))
+        Divider()
+      }
+      editorContent
+    }
+    .animation(.easeInOut(duration: 0.18), value: settings.queuePanelEnabled)
+    .animation(.easeInOut(duration: 0.18), value: queue.items.count)
+  }
+
+  private var editorContent: some View {
     VStack(spacing: 0) {
       // Editor Toolbar
       HStack(spacing: 12) {
@@ -1509,7 +2091,7 @@ struct EditorView: View {
     .onAppear {
       loadEditorImage()
     }
-    .onChange(of: imagePath) { _ in
+    .onChange(of: itemID) { _ in
       loadEditorImage()
     }
     .overlay {
@@ -1524,7 +2106,7 @@ struct EditorView: View {
       }
     }
   }
-  
+
   private func recordUndo() {
     undoStack.append(annotations)
     redoStack.removeAll()
