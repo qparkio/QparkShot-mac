@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="Sources/Assets.xcassets/AppIcon.appiconset/app_icon_128.png" width="96" height="96" alt="QparkShot-mac logo">
+  <img src="Sources/Assets.xcassets/AppIcon.appiconset/app_icon_128.png" width="96" height="96" alt="QPARK Shot app icon">
 </p>
 
-<h1 align="center">QparkShot-mac</h1>
+<h1 align="center">QPARK Shot for macOS</h1>
 
 <p align="center">
   Native macOS screenshot capture, annotation, watermarking, and local gallery app built with Swift, AppKit, and SwiftUI.
@@ -11,31 +11,57 @@
 <p align="center">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-12.3%2B-111111">
   <img alt="Swift" src="https://img.shields.io/badge/Swift-5-orange">
-  <img alt="License" src="https://img.shields.io/badge/License-MIT-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ## Overview
 
-QparkShot-mac is the open-source macOS version of QPARK Shot. It runs as a lightweight menu-bar utility, captures a selected area of the screen with the native macOS picker, and lets you annotate, watermark, copy, share, or save the result.
+QPARK Shot is a local-first screenshot utility for macOS. It runs from the menu bar, captures selected areas or the full screen, opens captures in an editor, and lets you annotate, crop, watermark, copy, share, or save the final PNG.
 
-The app is intentionally local-first: there are no analytics SDKs, backend calls, ad networks, or third-party runtime dependencies in this repository.
+The app is intentionally simple from an infrastructure point of view: no analytics SDKs, no ad networks, no backend services, and no third-party runtime dependencies.
 
 ## Features
 
-- Capture screenshots with a global hotkey or the menu-bar item.
-- Annotate with freehand drawing, arrows, rectangles, text, and crop tools.
-- Add text and logo watermarks with single-position or tiled diagonal layouts.
-- Manage recent screenshots in a local gallery with copy, share, reveal, and delete actions.
-- Export PNG files to `~/Pictures/QPARK Shot` by default, or choose another folder.
-- Automatically clean up temporary screenshots based on local preferences.
-- Follow the system appearance, or force light/dark mode with native macOS vibrancy.
+### Capture
+
+- Capture a selected screen area with the native macOS picker.
+- Capture the full screen from the menu-bar item or an optional global hotkey.
+- Add a capture delay of 3, 5, or 10 seconds.
+- Configure separate hotkeys for selection capture and full-screen capture.
+
+### Edit
+
+- Draw freehand lines, arrows, rectangles, and text annotations.
+- Crop screenshots before export.
+- Undo and redo annotation changes.
+- Preview the exported image before saving.
+- Copy the final image directly to the clipboard.
+- Share the final image through the native macOS share sheet.
+
+### Watermark
+
+- Add a text watermark with configurable color, opacity, size, and position.
+- Add a logo watermark from a user-selected image file.
+- Use a single-position watermark or a tiled diagonal layout.
+- Preview watermark output before saving.
+
+### Gallery and Storage
+
+- Save PNG files to `~/Pictures/QPARK Shot` by default.
+- Choose a custom save folder in Preferences.
+- Browse recent screenshots in a local gallery.
+- Open, copy, share, drag, or delete saved screenshots from the gallery.
+- Keep current-session captures in an optional editor buffer sidebar.
+- Automatically clean temporary files based on local cleanup preferences.
 
 ## Requirements
 
 - macOS 12.3 or later
 - Xcode 15 or later
+- Swift 5
 
-## Build And Run
+## Build and Run
 
 Open the project in Xcode:
 
@@ -43,61 +69,70 @@ Open the project in Xcode:
 open QPARKShot.xcodeproj
 ```
 
-Select the **QPARK Shot** scheme and press **Run**.
+Select the **QPARK Shot** scheme, choose **My Mac**, and press **Run**.
 
 Command-line release build:
 
 ```sh
-xcodebuild -project QPARKShot.xcodeproj -scheme "QPARK Shot" -configuration Release -derivedDataPath build/DerivedData clean build
+xcodebuild -project QPARKShot.xcodeproj \
+  -scheme "QPARK Shot" \
+  -configuration Release \
+  -derivedDataPath build/DerivedData \
+  clean build
 ```
 
-Build output is intentionally written under `./build`, which is ignored by Git. Do not commit `.app`, `.dmg`, `.pkg`, DerivedData, archives, local scripts, local docs, signing material, or private environment files.
+Generated build output is written under `./build`, which is ignored by Git.
 
 ## Permissions
 
-QPARK Shot needs macOS **Screen Recording** permission to capture the screen. On first capture, enable the app in:
+QPARK Shot needs macOS **Screen Recording** permission to capture screen content. On first capture, macOS may ask for this permission. If it does not, enable it manually:
 
 ```text
 System Settings -> Privacy & Security -> Screen & System Audio Recording
 ```
 
-Then quit and reopen the app.
+After changing the permission, quit and reopen QPARK Shot.
 
-If a stale permission remains after rebuilding, reset it manually:
+If a stale permission remains after rebuilding the app locally, reset it with:
 
 ```sh
 tccutil reset ScreenCapture com.qpark.shot
 ```
 
+The app also uses sandbox file entitlements for local image storage:
+
+- `com.apple.security.assets.pictures.read-write` for the default `~/Pictures/QPARK Shot` folder.
+- `com.apple.security.files.user-selected.read-write` for custom folders selected by the user.
+
+## Privacy
+
+Screenshots stay on the user's Mac. QPARK Shot does not collect personal data, does not include analytics, and does not transmit captured screen content.
+
+Saved screenshots are written locally to `~/Pictures/QPARK Shot` unless the user chooses another folder. Temporary captures are stored in the system temporary directory and can be cleared by the app's cleanup preferences.
+
 ## Project Structure
 
 ```text
 QPARKShot.xcodeproj/      Xcode project and shared scheme
-Sources/                  App source, Info.plist, entitlements, app icon
+Sources/                  App source, Info.plist, entitlements, and app icon
 ```
 
-Local helper scripts, local documentation pages, tests, and generated build output are intentionally excluded from the public repository.
+The public repository intentionally keeps the source tree small. Local helper scripts, local documentation pages, tests, generated build output, packaged apps, archives, signing material, provisioning profiles, private keys, and environment files are excluded by `.gitignore`.
 
-## Privacy
+## Before Publishing
 
-Screenshots are processed locally on the Mac. The app does not collect personal data, does not include analytics, and does not transmit captured screen content.
-
-The privacy policy is simple: screenshots stay on the user's Mac, and the app has no analytics or network backend.
-
-## Security Before Publishing
-
-Before pushing this repository publicly, verify that the publish set contains only app source, project files, checked-in image assets, and GitHub metadata:
+Before pushing or tagging a public release, verify the repository contains only source files and public assets:
 
 ```sh
 git status --short
 git check-ignore -v build scripts docs Tests "build/Release/QPARK Shot.app" || true
 ```
 
-The repository `.gitignore` excludes build output, DerivedData, local scripts, local docs, local tests, local IDE state, signing certificates, provisioning profiles, private keys, environment files, and packaged app artifacts.
+For App Store or notarized distribution, use a production signing configuration and make sure debug-only entitlements such as `com.apple.security.get-task-allow` are not enabled in the release binary.
 
 ## License
 
-QparkShot-mac is open source under the [MIT License](LICENSE).
+QPARK Shot for macOS is open source under the [MIT License](LICENSE).
 
 Copyright (c) 2026 QPARK.
 
