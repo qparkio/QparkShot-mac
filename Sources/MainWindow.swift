@@ -1,36 +1,31 @@
 import Cocoa
 import SwiftUI
-import Combine
-import ImageIO
+import UniformTypeIdentifiers
 
-enum MainWindowDestination: Equatable {
-  case gallery
-  case settings
-  case editor(UUID)
-}
-
+@MainActor
 final class MainWindowNavigation: ObservableObject {
   static let shared = MainWindowNavigation()
-
-  @Published private(set) var destination: MainWindowDestination = .gallery
 
   private init() {}
 
   func showGallery() {
-    destination = .gallery
+    WorkspaceStore.shared.showLibrary()
   }
 
   func showSettings() {
-    SettingsStore.shared.load()
-    destination = .settings
+    PreferencesWindowController.shared.show()
   }
 
   func openEditor(itemID: UUID) {
-    destination = .editor(itemID)
+    WorkspaceStore.shared.openEditor(itemID: itemID)
+  }
+
+  func showQuickAction(itemID: UUID) {
+    WorkspaceStore.shared.showCaptureReview(itemID: itemID)
   }
 }
 
-class MainAppWindow: NSWindow {
+final class MainAppWindow: NSWindow {
   static let mainWindowIdentifier = NSUserInterfaceItemIdentifier("QPARKShotMainWindow")
 
   private var didInstallRootContent = false
@@ -38,26 +33,25 @@ class MainAppWindow: NSWindow {
   func installRootContent() {
     guard !didInstallRootContent else { return }
     didInstallRootContent = true
-    
+
     identifier = Self.mainWindowIdentifier
     isReleasedWhenClosed = false
-    
-    let contentView = MainWindowView(navigation: MainWindowNavigation.shared)
-    let hostingController = NSHostingController(rootView: contentView)
-    
-    let windowFrame = self.frame
-    self.contentViewController = hostingController
-    self.setFrame(windowFrame, display: true)
-    self.title = "QPARK Shot"
+    minSize = NSSize(width: 920, height: 620)
 
-    // Enable native macOS vibrancy (frosted glass) effect
-    self.titlebarAppearsTransparent = false
-    self.titleVisibility = .visible
-    if self.styleMask.contains(.fullSizeContentView) {
-      self.styleMask.remove(.fullSizeContentView)
+    let rootView = WorkspaceRootView(store: WorkspaceStore.shared)
+    let hostingController = NSHostingController(rootView: rootView)
+    let windowFrame = frame
+    contentViewController = hostingController
+    setFrame(windowFrame, display: true)
+    title = localized("app.name")
+
+    titlebarAppearsTransparent = false
+    titleVisibility = .visible
+    if styleMask.contains(.fullSizeContentView) {
+      styleMask.remove(.fullSizeContentView)
     }
-    self.isOpaque = false
-    self.backgroundColor = .clear
+    isOpaque = false
+    backgroundColor = .clear
 
     let visualEffectView = NSVisualEffectView()
     visualEffectView.translatesAutoresizingMaskIntoConstraints = false
@@ -65,2221 +59,1165 @@ class MainAppWindow: NSWindow {
     visualEffectView.state = .active
     visualEffectView.blendingMode = .behindWindow
 
-    if let windowContentView = self.contentView {
+    if let windowContentView = contentView {
       windowContentView.addSubview(visualEffectView, positioned: .below, relativeTo: hostingController.view)
       NSLayoutConstraint.activate([
         visualEffectView.leadingAnchor.constraint(equalTo: windowContentView.leadingAnchor),
         visualEffectView.trailingAnchor.constraint(equalTo: windowContentView.trailingAnchor),
         visualEffectView.topAnchor.constraint(equalTo: windowContentView.topAnchor),
-        visualEffectView.bottomAnchor.constraint(equalTo: windowContentView.bottomAnchor),
+        visualEffectView.bottomAnchor.constraint(equalTo: windowContentView.bottomAnchor)
       ])
     }
   }
 }
 
-struct MainWindowView: View {
-  @ObservedObject var navigation: MainWindowNavigation
-  @ObservedObject private var store = SettingsStore.shared
-  
+struct WorkspaceRootView: View {
+  @ObservedObject var store: WorkspaceStore
+  @ObservedObject private var settings = SettingsStore.shared
+  @ObservedObject private var localization = LocalizationController.shared
+  @State private var columnVisibility: NavigationSplitViewVisibility = .all
+
   var body: some View {
-    content
-      .preferredColorScheme(store.preferredColorScheme)
-  }
-  
-  @ViewBuilder
-  private var content: some View {
-    switch navigation.destination {
-    case .gallery:
-      MainGalleryView()
-    case .settings:
-      SettingsView(store: SettingsStore.shared) {
-        navigation.showGallery()
-      }
-    case .editor(let itemID):
-      EditorView(
-        itemID: itemID,
-        onClose: {
-          navigation.showGallery()
-        },
-        onSave: {
-          DispatchQueue.main.async {
-            NotificationCenter.default.post(
-              name: NSNotification.Name("ReloadGalleryNotification"),
-              object: nil
-            )
-            navigation.showGallery()
+    NavigationSplitView(columnVisibility: $columnVisibility) {
+      WorkspaceSidebar(store: store)
+        .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
+    } detail: {
+      WorkspaceDetail(store: store)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .bottomTrailing) {
+          if let status = store.status {
+            WorkspaceStatusBanner(status: status)
+              .padding(QPARKDesign.pagePadding)
+              .transition(.move(edge: .bottom).combined(with: .opacity))
           }
         }
+        .animation(.easeOut(duration: 0.2), value: store.status?.id)
+    }
+    .toolbar {
+      WorkspaceToolbar(store: store)
+    }
+    .modifier(
+      WorkspaceSearchModifier(
+        isEnabled: store.selectedSection != .currentSession,
+        text: $store.searchText
       )
-      .id(itemID)
+    )
+    .inspector(isPresented: $store.isInspectorVisible) {
+      WorkspaceInspector(store: store)
+        .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
+    }
+    .background {
+      VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow)
+    }
+    .preferredColorScheme(settings.preferredColorScheme)
+    .environment(\.locale, localization.locale)
+    .environment(\.layoutDirection, localization.layoutDirection)
+    .onAppear {
+      store.bootstrap()
     }
   }
 }
 
-// MARK: - Main Gallery View
-struct MainGalleryView: View {
-  @State private var recentScreenshots: [String] = []
-  @State private var thumbnails: [String: NSImage] = [:]
-  @State private var pendingThumbnails: Set<String> = []
-  @State private var loadRequestID = UUID()
-  @State private var isBusy = false
-  
-  let reloadPublisher = NotificationCenter.default.publisher(for: NSNotification.Name("ReloadGalleryNotification"))
-  
-  var body: some View {
-    VStack(spacing: 0) {
-      // Gallery Toolbar
-      HStack {
-        Spacer()
-        
-        Button(action: {
-          AppDelegate.shared.triggerCaptureFlow()
-        }) {
-          Label("Capture", systemImage: "camera.viewfinder")
-            .font(.system(size: 12))
+private struct WorkspaceSearchModifier: ViewModifier {
+  let isEnabled: Bool
+  @Binding var text: String
+
+  @ViewBuilder
+  func body(content: Content) -> some View {
+    if isEnabled {
+      content.searchable(
+        text: $text,
+        placement: .toolbar,
+        prompt: Text(localized("workspace.search_placeholder"))
+      )
+    } else {
+      content
+    }
+  }
+}
+
+private struct WorkspaceToolbar: ToolbarContent {
+  @ObservedObject var store: WorkspaceStore
+
+  var body: some ToolbarContent {
+    ToolbarItemGroup(placement: .primaryAction) {
+      Button {
+        AppDelegate.shared.triggerCaptureFlow()
+      } label: {
+        if store.isCapturing {
+          Label(localized("status.capturing"), systemImage: "camera.viewfinder")
+        } else {
+          Label(localized("workspace.capture_cta"), systemImage: "camera.viewfinder")
         }
-        .buttonStyle(.bordered)
-        .disabled(isBusy)
-        
-        Button(action: {
-          AppDelegate.shared.showSettings()
-        }) {
-          Label("Preferences", systemImage: "gearshape")
-            .font(.system(size: 12))
-        }
-        .buttonStyle(.bordered)
-        .help("Preferences")
-        
-        Button(action: {
-          clearCache()
-        }) {
-          Image(systemName: "trash")
-            .font(.system(size: 12))
-        }
-        .buttonStyle(.bordered)
-        .help("Clear Cache")
       }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 10)
-      .background(Color.clear)
-      
-      Divider()
-      
-      // Screenshots Grid
-      if recentScreenshots.isEmpty {
-        VStack(spacing: 12) {
-          Image(systemName: "photo.on.rectangle.angled")
-            .font(.system(size: 40))
-            .foregroundColor(.secondary)
-          Text("No screenshots found.")
-            .font(.system(size: 13))
-            .foregroundColor(.secondary)
+      .buttonStyle(.borderedProminent)
+      .disabled(store.isCapturing)
+      .help(localized("capture.selected_area"))
+      .accessibilityLabel(localized("capture.selected_area"))
+      .accessibilityIdentifier("workspace.capture")
+    }
+
+    ToolbarItemGroup(placement: .automatic) {
+      Button {
+        PreferencesWindowController.shared.show()
+      } label: {
+        Image(systemName: "gearshape")
+      }
+      .help(localized("common.preferences"))
+      .accessibilityLabel(localized("common.preferences"))
+      .accessibilityIdentifier("workspace.settings")
+
+      Button {
+        store.isInspectorVisible.toggle()
+      } label: {
+        Image(systemName: "sidebar.right")
+      }
+      .help(localized("workspace.inspector"))
+      .accessibilityLabel(localized("workspace.inspector"))
+      .accessibilityValue(store.isInspectorVisible ? localized("status.visible") : localized("status.hidden"))
+    }
+  }
+}
+
+private struct WorkspaceSidebar: View {
+  @ObservedObject var store: WorkspaceStore
+  @ObservedObject private var queue = ShotQueueStore.shared
+  @ObservedObject private var drafts = EditorDraftStore.shared
+  @State private var confirmsClear = false
+
+  var body: some View {
+    List(selection: sectionBinding) {
+      Section {
+        ForEach(WorkspaceSection.allCases) { section in
+          HStack(spacing: 8) {
+            Label(localized(section.titleKey), systemImage: section.iconName)
+            Spacer()
+            if section == .currentSession, !queue.items.isEmpty {
+              Text("\(queue.items.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: Capsule())
+            } else if section == .missing, !store.missingShots.isEmpty {
+              Text("\(store.missingShots.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.orange)
+            }
+          }
+          .tag(section)
+          .accessibilityIdentifier("sidebar.\(section.rawValue)")
+          .accessibilityValue(section == store.selectedSection ? localized("status.selected") : "")
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } header: {
+        HStack(spacing: 9) {
+          BrandMark(size: 30)
+          Text(localized("app.name"))
+            .font(.headline)
+        }
+        .textCase(nil)
+        .padding(.vertical, 6)
+      }
+    }
+    .listStyle(.sidebar)
+    .safeAreaInset(edge: .bottom) {
+      Button {
+        confirmsClear = true
+      } label: {
+        Label(localized("workspace.clear_session"), systemImage: "trash")
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .buttonStyle(.plain)
+      .disabled(queue.items.isEmpty)
+      .padding(12)
+      .background(.bar)
+      .accessibilityHint(localized("workspace.clear_session_message"))
+      .accessibilityIdentifier("session.clear")
+    }
+    .confirmationDialog(
+      localized("workspace.clear_session_title"),
+      isPresented: $confirmsClear
+    ) {
+      Button(localized("workspace.clear_session"), role: .destructive) {
+        queue.clearAll()
+        drafts.clear()
+        store.showCurrentSession()
+        store.presentStatus(localized("workspace.clear_session"), kind: .success)
+      }
+      .accessibilityIdentifier("session.clear.confirm")
+      Button(localized("common.cancel"), role: .cancel) {}
+    } message: {
+      Text(clearSessionMessage)
+    }
+  }
+
+  private var clearSessionMessage: String {
+    let count = LocalizationController.shared.format(
+      "workspace.clear_session_count",
+      queue.temporaryItemCount
+    )
+    let hasDirtyDrafts = queue.items.contains { drafts.drafts[$0.id]?.isDirty == true }
+    return hasDirtyDrafts
+      ? count + " " + localized("workspace.unsaved_draft_warning")
+      : count
+  }
+
+  private var sectionBinding: Binding<WorkspaceSection?> {
+    Binding(
+      get: { store.selectedSection },
+      set: { value in
+        if let value {
+          select(value)
+        }
+      }
+    )
+  }
+
+  private func select(_ section: WorkspaceSection) {
+    switch section {
+    case .currentSession:
+      store.showCurrentSession()
+    case .library, .favorites, .recent, .missing:
+      store.selectedSection = section
+      store.mode = .library
+      store.loadLibrary()
+    }
+  }
+}
+
+private struct WorkspaceDetail: View {
+  @ObservedObject var store: WorkspaceStore
+  @ObservedObject private var queue = ShotQueueStore.shared
+
+  var body: some View {
+    Group {
+      if store.selectedSection == .currentSession, case .library = store.mode {
+        SessionOverviewView(store: store)
+      } else {
+        switch store.mode {
+        case .library:
+          LibraryWorkspaceView(store: store)
+        case .captureReview(let itemID):
+          CaptureReviewView(itemID: itemID, store: store)
+        case .editor(let itemID):
+          EditorWorkspaceView(itemID: itemID, store: store)
+        case .permissionRequired:
+          PermissionRequiredView()
+        case .error(let message):
+          ErrorStateView(message: message)
+        }
+      }
+    }
+  }
+}
+
+private struct LibraryWorkspaceView: View {
+  @ObservedObject var store: WorkspaceStore
+  @FocusState private var focusedPath: String?
+
+  var body: some View {
+    Group {
+      if store.isBusy && store.libraryShots.isEmpty && store.missingShots.isEmpty {
+        ProgressView(localized("status.loading"))
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if store.selectedSection == .missing {
+        missingContent
+      } else if store.displayedLibraryShots.isEmpty {
+        EmptyLibraryView(
+          section: store.selectedSection,
+          isSearchEmpty: store.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
       } else {
         ScrollView {
-          LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 180), spacing: 14)], spacing: 14) {
-            ForEach(recentScreenshots, id: \.self) { path in
-              ScreenshotGridItem(
-                path: path,
-                thumbnail: thumbnails[path],
-                onLoad: { loadThumbnailIfNeeded(path: path) },
-                onOpen: { AppDelegate.shared.openEditor(forPath: path) },
-                onCopy: { copyToClipboard(path: path) },
-                onShare: { shareImage(path: path) },
-                onDelete: { deleteImage(path: path) }
+          LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 280), spacing: 16)], spacing: 16) {
+            ForEach(store.displayedLibraryShots) { shot in
+              WorkspaceShotTile(
+                shot: shot,
+                isSelected: store.selectedLibraryPath == shot.path,
+                focus: $focusedPath,
+                onSelect: {
+                  focusedPath = shot.path
+                  store.selectLibraryShot(shot)
+                },
+                onMoveFocus: { direction in moveFocus(from: shot.path, direction: direction) },
+                onOpen: { store.openEditor(forPath: shot.path) },
+                onCopy: { store.copyFinalImage(path: shot.path) },
+                onShare: { store.share(path: shot.path) },
+                onPin: { store.pin(path: shot.path) },
+                onFavorite: { store.toggleFavorite(path: shot.path) },
+                onDelete: { store.deleteLibraryShot(path: shot.path) }
               )
             }
           }
-          .padding(16)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      }
-    }
-    .background(VisualEffectView(material: .hudWindow, blendingMode: .behindWindow))
-    .onAppear {
-      loadRecent()
-      performCleanup()
-    }
-    .onReceive(reloadPublisher) { _ in
-      loadRecent()
-    }
-  }
-  
-  private func loadRecent() {
-    let requestID = UUID()
-    loadRequestID = requestID
-    let fileManager = FileManager.default
-    let saveDirectory = SettingsStore.shared.saveDirectory
-    
-    DispatchQueue.global(qos: .userInitiated).async {
-      var folderURL = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first!.appendingPathComponent("QPARK Shot")
-      
-      if !saveDirectory.isEmpty {
-        folderURL = URL(fileURLWithPath: saveDirectory)
-      }
-      
-      var allPaths: [String] = []
-      
-      if let contents = try? fileManager.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles) {
-        allPaths.append(contentsOf: contents.filter { $0.pathExtension.lowercased() == "png" }.map { $0.path })
-      }
-      
-      let tempFolder = fileManager.temporaryDirectory.appendingPathComponent("QPARK Shot")
-      if let tempContents = try? fileManager.contentsOfDirectory(at: tempFolder, includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles) {
-        allPaths.append(contentsOf: tempContents.filter { $0.pathExtension.lowercased() == "png" }.map { $0.path })
-      }
-      
-      let sortedPaths = allPaths.sorted { path1, path2 in
-        let d1 = (try? URL(fileURLWithPath: path1).resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
-        let d2 = (try? URL(fileURLWithPath: path2).resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
-        return d1 > d2
-      }
-      
-      DispatchQueue.main.async {
-        guard loadRequestID == requestID else { return }
-        let validPaths = Set(sortedPaths)
-        recentScreenshots = sortedPaths
-        thumbnails = thumbnails.filter { validPaths.contains($0.key) }
-        pendingThumbnails = pendingThumbnails.filter { validPaths.contains($0) }
-      }
-    }
-  }
-  
-  private func loadThumbnailIfNeeded(path: String) {
-    guard thumbnails[path] == nil, !pendingThumbnails.contains(path) else { return }
-    pendingThumbnails.insert(path)
-    
-    DispatchQueue.global(qos: .utility).async {
-      let thumbnail = makeThumbnailImage(path: path, maxPixelSize: 360)
-      DispatchQueue.main.async {
-        pendingThumbnails.remove(path)
-        guard recentScreenshots.contains(path) else { return }
-        if let thumbnail {
-          thumbnails[path] = thumbnail
+          .padding(QPARKDesign.pagePadding)
         }
       }
     }
-  }
-  
-  private func deleteImage(path: String) {
-    try? FileManager.default.removeItem(atPath: path)
-    thumbnails.removeValue(forKey: path)
-    pendingThumbnails.remove(path)
-    loadRecent()
-  }
-  
-  private func clearCache() {
-    let fileManager = FileManager.default
-    let tempFolder = fileManager.temporaryDirectory.appendingPathComponent("QPARK Shot")
-    let contents = (try? fileManager.contentsOfDirectory(at: tempFolder, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
-    for fileURL in contents {
-      try? fileManager.removeItem(at: fileURL)
-    }
-    thumbnails.removeAll()
-    pendingThumbnails.removeAll()
-    loadRecent()
-  }
-  
-  private func copyToClipboard(path: String) {
-    guard !isBusy else { return }
-    isBusy = true
-    
-    DispatchQueue.global(qos: .userInitiated).async {
-      let image = loadImageForRendering(path: path)
-      DispatchQueue.main.async {
-        isBusy = false
-        guard let image else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects([image])
-      }
+    .onChange(of: store.searchText) {
+      focusedPath = nil
     }
   }
-  
-  private func shareImage(path: String) {
-    let url = URL(fileURLWithPath: path)
-    let picker = NSSharingServicePicker(items: [url])
-    DispatchQueue.main.async {
-      if let window = NSApp.keyWindow, let contentView = window.contentView {
-        let rect = NSRect(x: contentView.bounds.midX, y: contentView.bounds.midY, width: 1, height: 1)
-        picker.show(relativeTo: rect, of: contentView, preferredEdge: .minY)
-      }
-    }
-  }
-  
-  private func performCleanup() {
-    let store = SettingsStore.shared
-    guard store.cleanupMode == "afterDuration" else { return }
-    
-    let cleanupIncludeSaved = store.cleanupIncludeSaved
-    let cleanupDurationHours = store.cleanupDurationHours
-    let saveDirectory = store.saveDirectory
-    
-    DispatchQueue.global(qos: .utility).async {
-      let limitDate = Date().addingTimeInterval(-cleanupDurationHours * 3600.0)
-      let fileManager = FileManager.default
-      
-      if cleanupIncludeSaved {
-        var folderURL = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first!.appendingPathComponent("QPARK Shot")
-        if !saveDirectory.isEmpty {
-          folderURL = URL(fileURLWithPath: saveDirectory)
-        }
-        
-        let contents = (try? fileManager.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles)) ?? []
-        for fileURL in contents {
-          if let creationDate = try? fileURL.resourceValues(forKeys: [.creationDateKey]).creationDate,
-             creationDate < limitDate {
-            try? fileManager.removeItem(at: fileURL)
+
+  @ViewBuilder
+  private var missingContent: some View {
+    if store.displayedMissingShots.isEmpty {
+      ContentUnavailableView(
+        localized("workspace.no_missing"),
+        systemImage: "checkmark.circle",
+        description: Text(
+          store.searchText.isEmpty
+            ? localized("workspace.missing_hint")
+            : localized("workspace.no_matches")
+        )
+      )
+    } else {
+      ScrollView {
+        LazyVGrid(
+          columns: [GridItem(.adaptive(minimum: 260, maximum: 360), spacing: 16)],
+          spacing: 16
+        ) {
+          ForEach(store.displayedMissingShots) { shot in
+            MissingShotTile(
+              shot: shot,
+              isSelected: store.selectedLibraryPath == shot.path,
+              onSelect: { store.selectMissingShot(shot) },
+              onLocate: { locate(shot) },
+              onForget: { store.forgetMissing(path: shot.path) }
+            )
           }
         }
-      }
-      
-      let tempFolder = fileManager.temporaryDirectory.appendingPathComponent("QPARK Shot")
-      let tempContents = (try? fileManager.contentsOfDirectory(at: tempFolder, includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles)) ?? []
-      for fileURL in tempContents {
-        if let creationDate = try? fileURL.resourceValues(forKeys: [.creationDateKey]).creationDate,
-           creationDate < limitDate {
-          try? fileManager.removeItem(at: fileURL)
-        }
-      }
-      
-      DispatchQueue.main.async {
-        loadRecent()
+        .padding(QPARKDesign.pagePadding)
       }
     }
+  }
+
+  private func locate(_ shot: GalleryIndexEntry) {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = false
+    panel.canChooseFiles = true
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = [.image]
+    panel.prompt = localized("common.locate")
+    if panel.runModal() == .OK, let url = panel.url {
+      let bookmark = try? url.bookmarkData(
+        options: [.withSecurityScope],
+        includingResourceValuesForKeys: nil,
+        relativeTo: nil
+      )
+      store.relinkMissing(from: shot.path, to: url, bookmarkData: bookmark)
+    }
+  }
+
+  private func moveFocus(from path: String, direction: MoveCommandDirection) {
+    let shots = store.displayedLibraryShots
+    guard let index = shots.firstIndex(where: { $0.path == path }) else { return }
+    let delta = direction == .left || direction == .up ? -1 : 1
+    let nextIndex = min(max(index + delta, 0), shots.count - 1)
+    let next = shots[nextIndex]
+    focusedPath = next.path
+    store.selectLibraryShot(next)
   }
 }
 
-struct ScreenshotGridItem: View {
-  let path: String
-  let thumbnail: NSImage?
-  let onLoad: () -> Void
+private struct WorkspaceShotTile: View {
+  let shot: LibraryShot
+  let isSelected: Bool
+  let focus: FocusState<String?>.Binding
+  let onSelect: () -> Void
+  let onMoveFocus: (MoveCommandDirection) -> Void
   let onOpen: () -> Void
   let onCopy: () -> Void
   let onShare: () -> Void
+  let onPin: () -> Void
+  let onFavorite: () -> Void
   let onDelete: () -> Void
-  
+
+  @State private var thumbnail: NSImage?
   @State private var isHovered = false
-  
+
+  private var isFocused: Bool { focus.wrappedValue == shot.path }
+
   var body: some View {
-    let url = URL(fileURLWithPath: path)
-    
-    VStack(alignment: .leading, spacing: 4) {
-      ZStack(alignment: .topTrailing) {
-        if let thumbnail {
-          Image(nsImage: thumbnail)
-            .resizable()
-            .aspectRatio(contentMode: .fill)
-            .frame(width: 140, height: 95)
-            .clipped()
-            .cornerRadius(6)
-        } else {
-          ZStack {
-            Color.gray.opacity(0.28)
-            ProgressView()
-              .controlSize(.small)
-          }
-          .frame(width: 140, height: 95)
-          .cornerRadius(6)
+    ZStack(alignment: .topTrailing) {
+      Button(action: activate) {
+        VStack(alignment: .leading, spacing: 8) {
+          ImagePreview(image: thumbnail, cornerRadius: QPARKDesign.previewRadius)
+            .aspectRatio(1.45, contentMode: .fit)
+            .frame(maxWidth: .infinity)
+            .overlay(alignment: .topLeading) {
+              if shot.entry.favorite {
+                Image(systemName: "star.fill")
+                  .foregroundStyle(.yellow)
+                  .padding(8)
+                  .accessibilityHidden(true)
+              }
+            }
+
+          Text(shot.url.lastPathComponent)
+            .font(.callout.weight(.medium))
+            .lineLimit(1)
+            .truncationMode(.middle)
+
+          Text(shot.createdAt, format: .dateTime.day().month().year().hour().minute())
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        
-        if isHovered {
-          Color.black.opacity(0.2)
-            .cornerRadius(6)
-          
-          Button(action: onDelete) {
-            Image(systemName: "trash")
-              .font(.system(size: 10, weight: .bold))
-              .foregroundColor(.white)
-              .padding(5)
-              .background(Color.red)
-              .clipShape(Circle())
-          }
-          .buttonStyle(.plain)
-          .padding(6)
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+          RoundedRectangle(cornerRadius: QPARKDesign.cardRadius, style: .continuous)
+            .fill(isSelected ? Color.accentColor.opacity(0.11) : Color.primary.opacity(isHovered ? 0.06 : 0.035))
+        }
+        .overlay {
+          RoundedRectangle(cornerRadius: QPARKDesign.cardRadius, style: .continuous)
+            .stroke(
+              isFocused ? QPARKDesign.brandCyan : (isSelected ? Color.accentColor : Color.primary.opacity(0.10)),
+              lineWidth: isFocused || isSelected ? 2 : 1
+            )
         }
       }
-      .onAppear(perform: onLoad)
-      .onHover { isHovered = $0 }
-      .onTapGesture(perform: onOpen)
-      .onDrag {
-        let provider = NSItemProvider()
-        provider.suggestedName = url.lastPathComponent
-        provider.registerFileRepresentation(
-          forTypeIdentifier: "public.png",
-          fileOptions: [],
-          visibility: .all
-        ) { completion in
-          completion(url, true, nil)
-          return nil
+      .buttonStyle(.plain)
+      .focused(focus, equals: shot.path)
+      .simultaneousGesture(TapGesture(count: 2).onEnded(onOpen))
+      .onKeyPress(.return) {
+        onOpen()
+        return .handled
+      }
+      .onMoveCommand(perform: onMoveFocus)
+      .accessibilityLabel(shot.url.lastPathComponent)
+      .accessibilityValue(isSelected ? localized("status.selected") : "")
+      .accessibilityHint(localized("common.edit"))
+      .accessibilityIdentifier("shot.\(shot.url.lastPathComponent)")
+
+      if isHovered || isFocused {
+        HStack(spacing: 4) {
+          tileAction(localized("common.edit"), icon: "pencil", action: onOpen)
+          tileAction(localized("common.copy"), icon: "doc.on.doc", action: onCopy)
+          tileAction(localized("common.share"), icon: "square.and.arrow.up", action: onShare)
+          Menu {
+            Button(localized("common.pin"), action: onPin)
+            Button(
+              shot.entry.favorite ? localized("common.remove_favorite") : localized("common.favorite"),
+              action: onFavorite
+            )
+            Button(localized("common.show_in_finder")) {
+              NSWorkspace.shared.activateFileViewerSelecting([shot.url])
+            }
+            Divider()
+            Button(localized("common.move_to_trash"), role: .destructive, action: onDelete)
+          } label: {
+            Image(systemName: "ellipsis.circle.fill")
+          }
+          .menuStyle(.borderlessButton)
+          .help(localized("common.more"))
+          .accessibilityLabel(localized("common.more"))
         }
-        return provider
+        .controlSize(.small)
+        .padding(14)
+        .transition(.opacity)
       }
 
-      Text(url.lastPathComponent)
-        .font(.system(size: 10))
-        .foregroundColor(.secondary)
-        .lineLimit(1)
-        .frame(width: 140, alignment: .leading)
     }
+    .onHover { isHovered = $0 }
+    .onAppear(perform: loadThumbnail)
+    .draggable(shot.url)
     .contextMenu {
-      Button("Edit", action: onOpen)
-      Button("Copy to Clipboard", action: onCopy)
-      Button("Share...", action: onShare)
-      Button("Show in Finder") {
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+      Button(localized("common.edit"), action: onOpen)
+      Button(localized("common.copy"), action: onCopy)
+      Button(localized("common.share"), action: onShare)
+      Button(localized("common.pin"), action: onPin)
+      Button(shot.entry.favorite ? localized("common.remove_favorite") : localized("common.favorite"), action: onFavorite)
+      Button(localized("common.show_in_finder")) {
+        NSWorkspace.shared.activateFileViewerSelecting([shot.url])
       }
       Divider()
-      Button("Delete", role: .destructive, action: onDelete)
-    }
-  }
-}
-
-private func makeThumbnailImage(path: String, maxPixelSize: CGFloat) -> NSImage? {
-  let url = URL(fileURLWithPath: path) as CFURL
-  let sourceOptions = [
-    kCGImageSourceShouldCache: false
-  ] as CFDictionary
-  guard let source = CGImageSourceCreateWithURL(url, sourceOptions) else {
-    return nil
-  }
-  
-  let thumbnailOptions = [
-    kCGImageSourceCreateThumbnailFromImageAlways: true,
-    kCGImageSourceCreateThumbnailWithTransform: true,
-    kCGImageSourceShouldCacheImmediately: true,
-    kCGImageSourceThumbnailMaxPixelSize: Int(maxPixelSize)
-  ] as CFDictionary
-  
-  guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
-    return nil
-  }
-  
-  return NSImage(
-    cgImage: cgImage,
-    size: CGSize(width: cgImage.width, height: cgImage.height)
-  )
-}
-
-private func loadImageForRendering(path: String) -> NSImage? {
-  let url = URL(fileURLWithPath: path) as CFURL
-  let options = [
-    kCGImageSourceShouldCache: true,
-    kCGImageSourceShouldCacheImmediately: true
-  ] as CFDictionary
-  
-  if let source = CGImageSourceCreateWithURL(url, options),
-     let cgImage = CGImageSourceCreateImageAtIndex(source, 0, options) {
-    return NSImage(
-      cgImage: cgImage,
-      size: CGSize(width: cgImage.width, height: cgImage.height)
-    )
-  }
-  
-  return NSImage(contentsOfFile: path)
-}
-
-// MARK: - Settings Store
-class SettingsStore: ObservableObject {
-  static let shared = SettingsStore()
-  
-  @Published var themePreference: String = "system"
-  @Published var hotkeyEnabled: Bool = true
-  @Published var hotkeyKey: String = "C"
-  @Published var hotkeyModifiers: [String] = ["command", "shift"]
-  @Published var watermarkTextEnabled: Bool = false
-  @Published var watermarkText: String = "QPARK Shot"
-  @Published var watermarkTextColor: String = "#FFFFFF"
-  @Published var watermarkLogoEnabled: Bool = false
-  @Published var watermarkLogoPath: String = ""
-  @Published var watermarkOpacity: Double = 0.5
-  @Published var watermarkSize: Double = 120.0
-  @Published var watermarkPosition: String = "bottomRight"
-  @Published var watermarkLayoutMode: String = "single"
-  @Published var watermarkSpacing: Double = 150.0
-  @Published var watermarkTilePattern: String = "aligned"
-  @Published var watermarkTileRandomness: Double = 0.45
-  @Published var cleanupMode: String = "never"
-  @Published var cleanupIncludeSaved: Bool = false
-  @Published var cleanupDurationHours: Double = 24
-  @Published var saveDirectory: String = ""
-
-  // Shot queue (buffer) sidebar in editor
-  @Published var queuePanelEnabled: Bool = true
-
-  // Capture modes
-  @Published var captureMode: String = "selection"        // "selection" | "fullScreen"
-  @Published var captureDelaySeconds: Int = 0             // 0 / 3 / 5 / 10
-
-  // Full-screen capture hotkey (independent from selection hotkey)
-  @Published var fullScreenHotkeyEnabled: Bool = false
-  @Published var fullScreenHotkeyKey: String = "F"
-  @Published var fullScreenHotkeyModifiers: [String] = ["command", "shift"]
-  
-  var preferredColorScheme: ColorScheme? {
-    switch themePreference {
-    case "light":
-      return .light
-    case "dark":
-      return .dark
-    default:
-      return nil
-    }
-  }
-  
-  var appKitAppearanceName: NSAppearance.Name? {
-    switch themePreference {
-    case "light":
-      return .aqua
-    case "dark":
-      return .darkAqua
-    default:
-      return nil
+      Button(localized("common.move_to_trash"), role: .destructive, action: onDelete)
     }
   }
 
-  init() {
-    load()
+  private func tileAction(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Image(systemName: icon)
+        .frame(width: 20, height: 20)
+    }
+    .buttonStyle(.bordered)
+    .help(title)
+    .accessibilityLabel(title)
   }
 
-  func load() {
-    let key = "flutter.qpark_shot.app_settings.v1"
-    guard let jsonString = UserDefaults.standard.string(forKey: key),
-          let data = jsonString.data(using: .utf8),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      return
-    }
-    if let theme = json["themePreference"] as? String {
-      self.themePreference = theme
-    }
-    if let hotkey = json["hotkey"] as? [String: Any] {
-      self.hotkeyEnabled = hotkey["enabled"] as? Bool ?? true
-      self.hotkeyKey = hotkey["key"] as? String ?? "C"
-      self.hotkeyModifiers = hotkey["modifiers"] as? [String] ?? ["command", "shift"]
-    }
-    if let watermark = json["watermark"] as? [String: Any] {
-      self.watermarkLayoutMode = watermark["layoutMode"] as? String ?? "single"
-      self.watermarkSpacing = watermark["spacing"] as? Double ?? 150.0
-      self.watermarkTilePattern = watermark["tilePattern"] as? String ?? "aligned"
-      self.watermarkTileRandomness = watermark["tileRandomness"] as? Double ?? 0.45
-      if let textSettings = watermark["text"] as? [String: Any] {
-        self.watermarkTextEnabled = textSettings["enabled"] as? Bool ?? false
-        self.watermarkText = textSettings["text"] as? String ?? "QPARK Shot"
-        self.watermarkTextColor = textSettings["color"] as? String ?? "#FFFFFF"
-      }
-      if let logoSettings = watermark["logo"] as? [String: Any] {
-        self.watermarkLogoEnabled = logoSettings["enabled"] as? Bool ?? false
-        self.watermarkLogoPath = logoSettings["path"] as? String ?? ""
-        self.watermarkSize = logoSettings["size"] as? Double ?? 120.0
-        self.watermarkOpacity = logoSettings["opacity"] as? Double ?? 0.5
-        self.watermarkPosition = logoSettings["positionMode"] as? String ?? "bottomRight"
-      }
-    }
-    if let cleanup = json["cleanup"] as? [String: Any] {
-      self.cleanupMode = cleanup["mode"] as? String ?? "never"
-      self.cleanupIncludeSaved = cleanup["includeSavedFiles"] as? Bool ?? false
-      if let durationSec = cleanup["durationSeconds"] as? Double {
-        self.cleanupDurationHours = durationSec / 3600.0
-      }
-      self.saveDirectory = cleanup["saveDirectory"] as? String ?? ""
-    }
-    if let queue = json["queue"] as? [String: Any] {
-      self.queuePanelEnabled = queue["panelEnabled"] as? Bool ?? true
-    }
-    if let capture = json["capture"] as? [String: Any] {
-      self.captureMode = capture["mode"] as? String ?? "selection"
-      if let delay = capture["delaySeconds"] as? Int {
-        self.captureDelaySeconds = delay
-      } else if let delayDouble = capture["delaySeconds"] as? Double {
-        self.captureDelaySeconds = Int(delayDouble)
-      }
-    }
-    if let fsHotkey = json["fullScreenHotkey"] as? [String: Any] {
-      self.fullScreenHotkeyEnabled = fsHotkey["enabled"] as? Bool ?? false
-      self.fullScreenHotkeyKey = fsHotkey["key"] as? String ?? "F"
-      self.fullScreenHotkeyModifiers = fsHotkey["modifiers"] as? [String] ?? ["command", "shift"]
+  private func activate() {
+    let eventType = NSApp.currentEvent?.type
+    let isMouseActivation = eventType == .leftMouseDown || eventType == .leftMouseUp
+    if isSelected && !isMouseActivation {
+      onOpen()
+    } else {
+      onSelect()
     }
   }
 
-  func save() {
-    let key = "flutter.qpark_shot.app_settings.v1"
-    let json: [String: Any] = [
-      "themePreference": themePreference,
-      "hotkey": [
-        "enabled": hotkeyEnabled,
-        "key": hotkeyKey,
-        "modifiers": hotkeyModifiers
-      ],
-      "watermark": [
-        "layoutMode": watermarkLayoutMode,
-        "spacing": watermarkSpacing,
-        "tilePattern": watermarkTilePattern,
-        "tileRandomness": watermarkTileRandomness,
-        "text": [
-          "enabled": watermarkTextEnabled,
-          "text": watermarkText,
-          "color": watermarkTextColor
-        ],
-        "logo": [
-          "enabled": watermarkLogoEnabled,
-          "path": watermarkLogoPath,
-          "size": watermarkSize,
-          "opacity": watermarkOpacity,
-          "positionMode": watermarkPosition
-        ]
-      ],
-      "cleanup": [
-        "mode": cleanupMode,
-        "includeSavedFiles": cleanupIncludeSaved,
-        "durationSeconds": cleanupDurationHours * 3600.0,
-        "saveDirectory": saveDirectory
-      ],
-      "queue": [
-        "panelEnabled": queuePanelEnabled
-      ],
-      "capture": [
-        "mode": captureMode,
-        "delaySeconds": captureDelaySeconds
-      ],
-      "fullScreenHotkey": [
-        "enabled": fullScreenHotkeyEnabled,
-        "key": fullScreenHotkeyKey,
-        "modifiers": fullScreenHotkeyModifiers
-      ]
-    ]
-    if let data = try? JSONSerialization.data(withJSONObject: json, options: []),
-       let jsonString = String(data: data, encoding: .utf8) {
-      UserDefaults.standard.set(jsonString, forKey: key)
-      UserDefaults.standard.synchronize()
-    }
-    
-    // Notify AppDelegate to re-register hotkey
-    AppDelegate.shared.syncHotkeySettings()
-    AppDelegate.shared.applyThemePreference()
-  }
-}
-
-// MARK: - Shot Queue Store
-
-struct ShotQueueItem: Identifiable, Equatable {
-  let id: UUID
-  let path: String
-  let capturedAt: Date
-}
-
-final class ShotQueueStore: ObservableObject {
-  static let shared = ShotQueueStore()
-
-  @Published private(set) var items: [ShotQueueItem] = []
-  @Published var activeID: UUID? = nil
-
-  private init() {}
-
-  /// Append a captured shot to the queue and mark it active. Returns the created item.
-  @discardableResult
-  func enqueue(path: String, capturedAt: Date = Date()) -> ShotQueueItem {
-    if let existing = items.first(where: { $0.path == path }) {
-      activeID = existing.id
-      return existing
-    }
-    let item = ShotQueueItem(id: UUID(), path: path, capturedAt: capturedAt)
-    items.append(item)
-    activeID = item.id
-    return item
-  }
-
-  func item(for id: UUID) -> ShotQueueItem? {
-    items.first { $0.id == id }
-  }
-
-  func item(forPath path: String) -> ShotQueueItem? {
-    items.first { $0.path == path }
-  }
-
-  /// Remove an item. If it was active, advance activeID to the next neighbour (or nil).
-  /// Returns the new active id (or nil if queue is now empty).
-  @discardableResult
-  func remove(_ id: UUID) -> UUID? {
-    guard let index = items.firstIndex(where: { $0.id == id }) else { return activeID }
-    let removed = items.remove(at: index)
-
-    let tempPrefix = FileManager.default.temporaryDirectory.path
-    if removed.path.hasPrefix(tempPrefix) {
-      try? FileManager.default.removeItem(atPath: removed.path)
-    }
-
-    if activeID == id {
-      if items.isEmpty {
-        activeID = nil
-      } else {
-        let nextIndex = min(index, items.count - 1)
-        activeID = items[nextIndex].id
-      }
-    }
-    return activeID
-  }
-
-  /// Wipe the entire queue and delete any temp PNGs it owned.
-  func clearAll() {
-    let tempPrefix = FileManager.default.temporaryDirectory.path
-    for item in items where item.path.hasPrefix(tempPrefix) {
-      try? FileManager.default.removeItem(atPath: item.path)
-    }
-    items.removeAll()
-    activeID = nil
-  }
-}
-
-// MARK: - Watermark Live Preview Card
-struct WatermarkPreviewView: View {
-  let layoutMode: String
-  let textEnabled: Bool
-  let text: String
-  let textColor: String
-  let logoEnabled: Bool
-  let logoPath: String
-  let opacity: Double
-  let position: String
-  let logoSize: Double
-  let spacing: Double
-  let tilePattern: String
-  let tileRandomness: Double
-  
-  @State private var logoImage: NSImage? = nil
-  @State private var logoLoadRequestID = UUID()
-  
-  var body: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      Text("Live Preview")
-        .font(.system(size: 11, weight: .semibold))
-        .foregroundColor(.secondary)
-      
-      ZStack {
-        // Mock landscape gradient screenshot
-        LinearGradient(
-          gradient: Gradient(colors: [Color.blue.opacity(0.7), Color.indigo.opacity(0.8)]),
-          startPoint: .topLeading,
-          endPoint: .bottomTrailing
-        )
-        .cornerRadius(8)
-        
-        // Mock screenshot details (e.g. status bar at the top)
-        VStack {
-          HStack(spacing: 4) {
-            Circle().fill(Color.white.opacity(0.4)).frame(width: 6, height: 6)
-            Circle().fill(Color.white.opacity(0.4)).frame(width: 6, height: 6)
-            Circle().fill(Color.white.opacity(0.4)).frame(width: 6, height: 6)
-            Spacer()
-            RoundedRectangle(cornerRadius: 2).fill(Color.white.opacity(0.3)).frame(width: 30, height: 6)
-          }
-          .padding(8)
-          Spacer()
-        }
-        
-        // Watermark layouts
-        watermarkLayout
-      }
-      .frame(width: 170, height: 115)
-      .overlay(
-        RoundedRectangle(cornerRadius: 8)
-          .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-      )
-      .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-    }
-    .onAppear(perform: loadLogoPreview)
-    .onChange(of: logoPath) { _ in loadLogoPreview() }
-    .onChange(of: logoEnabled) { _ in loadLogoPreview() }
-  }
-  
-  private func getAlignment(for position: String) -> SwiftUI.Alignment {
-    switch position {
-    case "bottomRight": return SwiftUI.Alignment.bottomTrailing
-    case "bottomLeft": return SwiftUI.Alignment.bottomLeading
-    case "topRight": return SwiftUI.Alignment.topTrailing
-    case "topLeft": return SwiftUI.Alignment.topLeading
-    default: return SwiftUI.Alignment.center
-    }
-  }
-  
-  private var watermarkLayout: some View {
-    GeometryReader { geo in
-      if layoutMode == "tiled" {
-        Canvas { context, size in
-          let diagonal = sqrt(size.width * size.width + size.height * size.height)
-          let stepX = max(40.0, spacing / 3.0)
-          let stepY = max(30.0, spacing / 4.0)
-          
-          context.rotate(by: Angle(degrees: -30))
-          
-          // Let's resolve the logo image if enabled
-          var resolvedLogo: GraphicsContext.ResolvedImage? = nil
-          var logoW: CGFloat = 0
-          var logoH: CGFloat = 0
-          if logoEnabled {
-            if let img = logoImage {
-              resolvedLogo = context.resolve(Image(nsImage: img))
-              logoW = max(10, min(25, logoSize / 10))
-              logoH = img.size.height * (logoW / img.size.width)
-            } else {
-              resolvedLogo = context.resolve(Image(systemName: "photo.circle.fill"))
-              logoW = 14
-              logoH = 14
-            }
-          }
-          
-          var rowIndex = 0
-          for y in stride(from: -diagonal, to: diagonal, by: stepY) {
-            let rowOffset = tilePattern == "brick" || tilePattern == "random"
-              ? (rowIndex.isMultiple(of: 2) ? 0 : stepX / 2)
-              : 0
-            var columnIndex = 0
-            for x in stride(from: -diagonal, to: diagonal, by: stepX) {
-              let jitterLimit = tilePattern == "random"
-                ? min(stepX, stepY) * CGFloat(tileRandomness) * 0.35
-                : 0
-              let drawX = x + rowOffset + deterministicTileJitter(row: rowIndex, column: columnIndex, salt: 1) * jitterLimit
-              let drawY = y + deterministicTileJitter(row: rowIndex, column: columnIndex, salt: 2) * jitterLimit
-              
-              if let logo = resolvedLogo {
-                let logoRect = CGRect(x: drawX - logoW / 2, y: drawY - logoH / 2, width: logoW, height: logoH)
-                context.draw(logo, in: logoRect)
-              }
-              
-              if textEnabled && !text.isEmpty {
-                let txt = context.resolve(Text(text)
-                  .font(.system(size: 6, weight: .bold))
-                  .foregroundColor(Color(hexString: textColor)))
-                let textY = logoEnabled ? (drawY - logoH / 2 - 8) : (drawY - 3)
-                context.draw(txt, at: CGPoint(x: drawX, y: textY), anchor: .top)
-              }
-              columnIndex += 1
-            }
-            rowIndex += 1
-          }
-        }
-        .opacity(opacity)
-        .ignoresSafeArea()
-      } else {
-        VStack(spacing: 4) {
-          if logoEnabled, let img = logoImage {
-            Image(nsImage: img)
-              .resizable()
-              .aspectRatio(contentMode: .fit)
-              .frame(width: CGFloat(max(15, min(40, logoSize / 5))))
-              .opacity(opacity)
-          } else if logoEnabled {
-            Image(systemName: "photo.circle.fill")
-              .font(.system(size: 16))
-              .foregroundColor(.white)
-              .opacity(opacity)
-          }
-          
-          if textEnabled && !text.isEmpty {
-            Text(text)
-              .font(.system(size: 8, weight: .bold))
-              .foregroundColor(Color(hexString: textColor))
-              .lineLimit(1)
-              .opacity(opacity)
-          }
-        }
-        .padding(8)
-        .frame(width: geo.size.width, height: geo.size.height, alignment: getAlignment(for: position))
-      }
-    }
-  }
-  
-  private func loadLogoPreview() {
-    let requestID = UUID()
-    logoLoadRequestID = requestID
-    
-    guard logoEnabled, !logoPath.isEmpty else {
-      logoImage = nil
-      return
-    }
-    
-    let logoPathSnapshot = logoPath
+  private func loadThumbnail() {
+    guard thumbnail == nil else { return }
+    let path = shot.path
     DispatchQueue.global(qos: .utility).async {
-      let image = makeThumbnailImage(path: logoPathSnapshot, maxPixelSize: 180)
+      let image = makeThumbnailImage(path: path, maxPixelSize: 480)
       DispatchQueue.main.async {
-        guard logoLoadRequestID == requestID else { return }
-        logoImage = image
+        thumbnail = image
       }
     }
   }
 }
 
-// MARK: - Settings Card
-struct SettingsCard<Content: View>: View {
-  let content: Content
-  
-  init(@ViewBuilder content: () -> Content) {
-    self.content = content()
-  }
-  
+private struct MissingShotTile: View {
+  let shot: GalleryIndexEntry
+  let isSelected: Bool
+  let onSelect: () -> Void
+  let onLocate: () -> Void
+  let onForget: () -> Void
+  @FocusState private var isFocused: Bool
+
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      content
+        HStack(alignment: .top, spacing: 12) {
+          Image(systemName: "photo.badge.exclamationmark")
+            .font(.title2)
+            .foregroundStyle(.orange)
+            .frame(width: 34, height: 34)
+            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+          VStack(alignment: .leading, spacing: 4) {
+            Text(shot.fileName)
+              .font(.headline)
+              .lineLimit(2)
+            Text(shot.path)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(2)
+              .truncationMode(.middle)
+          }
+        }
+
+        HStack {
+          Button(localized("common.locate"), action: onLocate)
+            .buttonStyle(.borderedProminent)
+          Button(localized("common.forget"), role: .destructive, action: onForget)
+            .buttonStyle(.bordered)
+          Spacer()
+          if let missingSince = shot.missingSince {
+            Text(missingSince, format: .dateTime.day().month().year())
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+        }
     }
     .padding(14)
     .frame(maxWidth: .infinity, alignment: .leading)
-    .background(VisualEffectView(material: .contentBackground, blendingMode: .withinWindow))
-    .clipShape(RoundedRectangle(cornerRadius: 8))
-    .overlay(
-      RoundedRectangle(cornerRadius: 8)
-        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-    )
+    .qparkSurface(emphasized: isSelected || isFocused)
+    .contentShape(Rectangle())
+    .onTapGesture(perform: onSelect)
+    .focusable()
+    .focused($isFocused)
+    .onKeyPress(.return) {
+      onSelect()
+      return .handled
+    }
+    .accessibilityLabel(shot.fileName)
+    .accessibilityHint(localized("workspace.missing_hint"))
   }
 }
 
-// MARK: - Settings View
-struct SettingsView: View {
-  @ObservedObject var store: SettingsStore
-  var onBack: () -> Void = {}
-  @State private var activeTab = 0
-  
+private struct EmptyLibraryView: View {
+  let section: WorkspaceSection
+  let isSearchEmpty: Bool
+
   var body: some View {
-    HStack(spacing: 0) {
-      // Sidebar on the left
-      VStack(alignment: .leading, spacing: 0) {
-        Button(action: onBack) {
-          Label("Gallery", systemImage: "chevron.left")
-            .font(.system(size: 12, weight: .medium))
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 6)
-        
-        // App header
-        HStack(spacing: 10) {
-          Image(systemName: "viewfinder.circle.fill")
-            .font(.system(size: 26))
-            .foregroundColor(.accentColor)
-          VStack(alignment: .leading, spacing: 1) {
-            Text("QPARK Shot")
-              .font(.system(size: 13, weight: .bold))
-            Text("Preferences")
-              .font(.system(size: 10))
-              .foregroundColor(.secondary)
-          }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 20)
-        .padding(.bottom, 16)
-        
-        // Navigation items
-        VStack(spacing: 4) {
-          sidebarButton(index: 0, label: "Appearance", icon: "circle.lefthalf.filled", color: .teal)
-          sidebarButton(index: 1, label: "Hotkeys", icon: "keyboard", color: .blue)
-          sidebarButton(index: 2, label: "Watermark", icon: "signature", color: .purple)
-          sidebarButton(index: 3, label: "Storage", icon: "folder.fill", color: .orange)
-          sidebarButton(index: 4, label: "Buffer", icon: "tray.full", color: .pink)
-          sidebarButton(index: 5, label: "About", icon: "info.circle.fill", color: .gray)
-        }
-        .padding(.horizontal, 8)
-        
-        Spacer()
+    ContentUnavailableView {
+      Label(title, systemImage: systemImage)
+    } description: {
+      if !isSearchEmpty {
+        Text(localized("workspace.no_matches"))
       }
-      .frame(width: 170)
-      .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
-      
-      Divider()
-      
-      // Detail content area on the right
-      ScrollView {
-        VStack(alignment: .leading, spacing: 16) {
-          switch activeTab {
-          case 0:
-            appearanceTab
-          case 1:
-            hotkeysTab
-          case 2:
-            watermarkTab
-          case 3:
-            storageTab
-          case 4:
-            queueTab
-          default:
-            aboutTab
-          }
-        }
-        .padding(20)
+    } actions: {
+      Button {
+        AppDelegate.shared.triggerCaptureFlow()
+      } label: {
+        Label(localized("workspace.capture_cta"), systemImage: "camera.viewfinder")
       }
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-      .background(VisualEffectView(material: .windowBackground, blendingMode: .behindWindow))
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-  }
-  
-  private func sidebarButton(index: Int, label: String, icon: String, color: Color) -> some View {
-    Button(action: {
-      activeTab = index
-    }) {
-      HStack(spacing: 10) {
-        Image(systemName: icon)
-          .font(.system(size: 11, weight: .semibold))
-          .foregroundColor(.white)
-          .frame(width: 20, height: 20)
-          .background(color)
-          .cornerRadius(5)
-        
-        Text(label)
-          .font(.system(size: 12, weight: activeTab == index ? .medium : .regular))
-          .foregroundColor(activeTab == index ? .primary : .primary.opacity(0.8))
-        
-        Spacer()
-      }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
-      .background(
-        RoundedRectangle(cornerRadius: 6)
-          .fill(activeTab == index ? Color.primary.opacity(0.1) : Color.clear)
-      )
-    }
-    .buttonStyle(.plain)
-  }
-  
-  private func sectionHeader(title: String, icon: String, color: Color) -> some View {
-    HStack(spacing: 8) {
-      Image(systemName: icon)
-        .font(.system(size: 18, weight: .bold))
-        .foregroundColor(color)
-      Text(title)
-        .font(.system(size: 16, weight: .bold))
-    }
-    .padding(.bottom, 4)
-  }
-  
-  private var appearanceTab: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      sectionHeader(title: "Appearance", icon: "circle.lefthalf.filled", color: .teal)
-      
-      SettingsCard {
-        VStack(alignment: .leading, spacing: 10) {
-          Text("Theme")
-            .font(.system(size: 12, weight: .semibold))
-          
-          Picker("", selection: Binding(
-            get: { store.themePreference },
-            set: { store.themePreference = $0; store.save() }
-          )) {
-            Label("System", systemImage: "display").tag("system")
-            Label("Light", systemImage: "sun.max").tag("light")
-            Label("Dark", systemImage: "moon").tag("dark")
-          }
-          .pickerStyle(.segmented)
-          .labelsHidden()
-          
-          Text(appearanceDescription)
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-        }
-      }
-    }
-  }
-  
-  private var appearanceDescription: String {
-    switch store.themePreference {
-    case "light":
-      return "Forces the light appearance for the app window and glass materials."
-    case "dark":
-      return "Forces the dark appearance for the app window and glass materials."
-    default:
-      return "Follows the current macOS system appearance automatically."
-    }
-  }
-  
-  private var hotkeysTab: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      sectionHeader(title: "Hotkeys", icon: "keyboard", color: .blue)
-      
-      SettingsCard {
-        Toggle("Enable Global Capture Hotkey", isOn: Binding(
-          get: { store.hotkeyEnabled },
-          set: { store.hotkeyEnabled = $0; store.save() }
-        ))
-        .toggleStyle(.switch)
-        .font(.system(size: 12, weight: .semibold))
-        
-        if store.hotkeyEnabled {
-          Divider()
-          
-          HStack(spacing: 8) {
-            Text("Shortcut:")
-              .font(.system(size: 12))
-            
-            Toggle("Cmd", isOn: Binding(
-              get: { store.hotkeyModifiers.contains("command") },
-              set: { on in
-                if on {
-                  if !store.hotkeyModifiers.contains("command") { store.hotkeyModifiers.append("command") }
-                } else {
-                  store.hotkeyModifiers.removeAll { $0 == "command" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-            
-            Toggle("Shift", isOn: Binding(
-              get: { store.hotkeyModifiers.contains("shift") },
-              set: { on in
-                if on {
-                  if !store.hotkeyModifiers.contains("shift") { store.hotkeyModifiers.append("shift") }
-                } else {
-                  store.hotkeyModifiers.removeAll { $0 == "shift" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-            
-            Toggle("Option", isOn: Binding(
-              get: { store.hotkeyModifiers.contains("option") },
-              set: { on in
-                if on {
-                  if !store.hotkeyModifiers.contains("option") { store.hotkeyModifiers.append("option") }
-                } else {
-                  store.hotkeyModifiers.removeAll { $0 == "option" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-            
-            Toggle("Ctrl", isOn: Binding(
-              get: { store.hotkeyModifiers.contains("control") },
-              set: { on in
-                if on {
-                  if !store.hotkeyModifiers.contains("control") { store.hotkeyModifiers.append("control") }
-                } else {
-                  store.hotkeyModifiers.removeAll { $0 == "control" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-            
-            TextField("Key", text: Binding(
-              get: { store.hotkeyKey },
-              set: {
-                let cleaned = String($0.prefix(1)).uppercased()
-                store.hotkeyKey = cleaned
-                store.save()
-              }
-            ))
-            .frame(width: 40)
-            .textFieldStyle(.roundedBorder)
-            .multilineTextAlignment(.center)
-          }
-          .font(.system(size: 11))
-        }
-      }
-
-      // Full-screen capture hotkey
-      SettingsCard {
-        Toggle("Enable Full-Screen Capture Hotkey", isOn: Binding(
-          get: { store.fullScreenHotkeyEnabled },
-          set: { store.fullScreenHotkeyEnabled = $0; store.save() }
-        ))
-        .toggleStyle(.switch)
-        .font(.system(size: 12, weight: .semibold))
-
-        if store.fullScreenHotkeyEnabled {
-          Divider()
-
-          HStack(spacing: 8) {
-            Text("Shortcut:")
-              .font(.system(size: 12))
-
-            Toggle("Cmd", isOn: Binding(
-              get: { store.fullScreenHotkeyModifiers.contains("command") },
-              set: { on in
-                if on {
-                  if !store.fullScreenHotkeyModifiers.contains("command") { store.fullScreenHotkeyModifiers.append("command") }
-                } else {
-                  store.fullScreenHotkeyModifiers.removeAll { $0 == "command" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-
-            Toggle("Shift", isOn: Binding(
-              get: { store.fullScreenHotkeyModifiers.contains("shift") },
-              set: { on in
-                if on {
-                  if !store.fullScreenHotkeyModifiers.contains("shift") { store.fullScreenHotkeyModifiers.append("shift") }
-                } else {
-                  store.fullScreenHotkeyModifiers.removeAll { $0 == "shift" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-
-            Toggle("Option", isOn: Binding(
-              get: { store.fullScreenHotkeyModifiers.contains("option") },
-              set: { on in
-                if on {
-                  if !store.fullScreenHotkeyModifiers.contains("option") { store.fullScreenHotkeyModifiers.append("option") }
-                } else {
-                  store.fullScreenHotkeyModifiers.removeAll { $0 == "option" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-
-            Toggle("Ctrl", isOn: Binding(
-              get: { store.fullScreenHotkeyModifiers.contains("control") },
-              set: { on in
-                if on {
-                  if !store.fullScreenHotkeyModifiers.contains("control") { store.fullScreenHotkeyModifiers.append("control") }
-                } else {
-                  store.fullScreenHotkeyModifiers.removeAll { $0 == "control" }
-                }
-                store.save()
-              }
-            ))
-            .toggleStyle(.checkbox)
-
-            TextField("Key", text: Binding(
-              get: { store.fullScreenHotkeyKey },
-              set: {
-                let cleaned = String($0.prefix(1)).uppercased()
-                store.fullScreenHotkeyKey = cleaned
-                store.save()
-              }
-            ))
-            .frame(width: 40)
-            .textFieldStyle(.roundedBorder)
-            .multilineTextAlignment(.center)
-          }
-          .font(.system(size: 11))
-        }
-      }
-
-      // Capture mode + delay
-      SettingsCard {
-        VStack(alignment: .leading, spacing: 8) {
-          Text("Capture Mode")
-            .font(.system(size: 12, weight: .semibold))
-
-          Picker("", selection: Binding(
-            get: { store.captureMode },
-            set: { store.captureMode = $0; store.save() }
-          )) {
-            Text("Selection").tag("selection")
-            Text("Full Screen").tag("fullScreen")
-          }
-          .pickerStyle(.segmented)
-          .labelsHidden()
-
-          Divider()
-
-          HStack {
-            Text("Default Delay:")
-              .font(.system(size: 12))
-            Spacer()
-            Picker("", selection: Binding(
-              get: { store.captureDelaySeconds },
-              set: { store.captureDelaySeconds = $0; store.save() }
-            )) {
-              Text("None").tag(0)
-              Text("3 s").tag(3)
-              Text("5 s").tag(5)
-              Text("10 s").tag(10)
-            }
-            .pickerStyle(.menu)
-            .frame(width: 100)
-          }
-          Text("Delay applies to hotkey-triggered captures. The status-bar menu also provides one-shot delay options.")
-            .font(.system(size: 10))
-            .foregroundColor(.secondary)
-        }
-      }
+      .buttonStyle(.borderedProminent)
     }
   }
 
-  private var queueTab: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      sectionHeader(title: "Shot Buffer", icon: "tray.full", color: .pink)
-
-      SettingsCard {
-        VStack(alignment: .leading, spacing: 8) {
-          Toggle("Show buffer panel in editor", isOn: Binding(
-            get: { store.queuePanelEnabled },
-            set: { store.queuePanelEnabled = $0; store.save() }
-          ))
-          .toggleStyle(.switch)
-          .font(.system(size: 12, weight: .semibold))
-
-          Text("Keeps every screenshot you take in a vertical carousel on the left side of the editor. Click any item to switch, hover for preview-with-watermark and remove-from-buffer actions. The buffer lives only for the current session and is wiped on app restart.")
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-
-      SettingsCard {
-        HStack {
-          VStack(alignment: .leading, spacing: 2) {
-            Text("Current buffer")
-              .font(.system(size: 12, weight: .semibold))
-            Text("\(ShotQueueStore.shared.items.count) screenshot(s) in memory")
-              .font(.system(size: 11))
-              .foregroundColor(.secondary)
-          }
-          Spacer()
-          Button("Clear buffer") {
-            ShotQueueStore.shared.clearAll()
-          }
-          .disabled(ShotQueueStore.shared.items.isEmpty)
-        }
-      }
-    }
+  private var title: String {
+    if !isSearchEmpty { return localized("workspace.no_matches") }
+    return section == .recent ? localized("workspace.no_recent") : localized("workspace.no_shots")
   }
 
-  private var watermarkTab: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      sectionHeader(title: "Watermark Settings", icon: "signature", color: .purple)
-      
-      HStack(alignment: .top, spacing: 16) {
-        VStack(alignment: .leading, spacing: 12) {
-          // Layout selection card
-          SettingsCard {
-            VStack(alignment: .leading, spacing: 4) {
-              Text("Layout Mode")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundColor(.secondary)
-              Picker("", selection: Binding(
-                get: { store.watermarkLayoutMode },
-                set: { store.watermarkLayoutMode = $0; store.save() }
-              )) {
-                Text("Single Location").tag("single")
-                Text("Tiled Diagonal").tag("tiled")
-              }
-              .pickerStyle(.segmented)
-            }
-          }
-          
-          // Text Watermark Card
-          SettingsCard {
-            Toggle("Enable Text Watermark", isOn: Binding(
-              get: { store.watermarkTextEnabled },
-              set: { store.watermarkTextEnabled = $0; store.save() }
-            ))
-            .toggleStyle(.switch)
-            .font(.system(size: 12, weight: .semibold))
-            
-            if store.watermarkTextEnabled {
-              TextField("Watermark Text", text: Binding(
-                get: { store.watermarkText },
-                set: { store.watermarkText = $0; store.save() }
-              ))
-              .textFieldStyle(.roundedBorder)
-
-              HStack {
-                Text("Text Color:")
-                  .font(.system(size: 11))
-                Spacer()
-                ColorPicker("", selection: Binding(
-                  get: { Color(hexString: store.watermarkTextColor) },
-                  set: { store.watermarkTextColor = hexString(from: $0); store.save() }
-                ), supportsOpacity: false)
-                .labelsHidden()
-              }
-            }
-          }
-          
-          // Logo Watermark Card
-          SettingsCard {
-            Toggle("Enable Logo Watermark", isOn: Binding(
-              get: { store.watermarkLogoEnabled },
-              set: { store.watermarkLogoEnabled = $0; store.save() }
-            ))
-            .toggleStyle(.switch)
-            .font(.system(size: 12, weight: .semibold))
-            
-            if store.watermarkLogoEnabled {
-              VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                  TextField("Logo Path", text: Binding(
-                    get: { store.watermarkLogoPath.isEmpty ? "Select image..." : store.watermarkLogoPath },
-                    set: { _ in }
-                  ))
-                  .textFieldStyle(.roundedBorder)
-                  .disabled(true)
-                  
-                  Button("Browse...") {
-                    let panel = NSOpenPanel()
-                    panel.canChooseFiles = true
-                    panel.canChooseDirectories = false
-                    panel.allowsMultipleSelection = false
-                    panel.allowedContentTypes = [.image]
-                    if panel.runModal() == .OK {
-                      store.watermarkLogoPath = panel.url?.path ?? ""
-                      store.save()
-                    }
-                  }
-                }
-                
-                HStack {
-                  Text("Logo Size:")
-                    .font(.system(size: 11))
-                  Slider(value: Binding(
-                    get: { store.watermarkSize },
-                    set: { store.watermarkSize = $0; store.save() }
-                  ), in: 50...300)
-                  Text("\(Int(store.watermarkSize))px")
-                    .font(.system(size: 11))
-                    .frame(width: 45, alignment: .trailing)
-                }
-              }
-            }
-          }
-          
-          // Formatting Card
-          SettingsCard {
-            VStack(alignment: .leading, spacing: 8) {
-              if store.watermarkLayoutMode == "single" {
-                HStack {
-                  Text("Position:")
-                  Spacer()
-                  Picker("", selection: Binding(
-                    get: { store.watermarkPosition },
-                    set: { store.watermarkPosition = $0; store.save() }
-                  )) {
-                    Text("Bottom Right").tag("bottomRight")
-                    Text("Bottom Left").tag("bottomLeft")
-                    Text("Top Right").tag("topRight")
-                    Text("Top Left").tag("topLeft")
-                    Text("Center").tag("center")
-                  }
-                  .pickerStyle(.menu)
-                  .frame(width: 130)
-                }
-                Divider()
-              }
-              
-              HStack {
-                Text("Opacity:")
-                Slider(value: Binding(
-                  get: { store.watermarkOpacity },
-                  set: { store.watermarkOpacity = $0; store.save() }
-                ), in: 0.1...1.0)
-                Text(String(format: "%.0f%%", store.watermarkOpacity * 100))
-                  .frame(width: 40, alignment: .trailing)
-              }
-            }
-            .font(.system(size: 11))
-          }
-          if store.watermarkLayoutMode == "tiled" {
-            SettingsCard {
-              VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                  Text("Pattern:")
-                  Spacer()
-                  Picker("", selection: Binding(
-                    get: { store.watermarkTilePattern },
-                    set: { store.watermarkTilePattern = $0; store.save() }
-                  )) {
-                    Text("Aligned").tag("aligned")
-                    Text("Brick").tag("brick")
-                    Text("Chaos").tag("random")
-                  }
-                  .pickerStyle(.menu)
-                  .frame(width: 110)
-                }
-                
-                Text("Watermark Density (Spacing):")
-                  .font(.system(size: 10, weight: .bold))
-                  .foregroundColor(.secondary)
-                HStack {
-                  Slider(value: Binding(
-                    get: { store.watermarkSpacing },
-                    set: { store.watermarkSpacing = $0; store.save() }
-                  ), in: 80...400)
-                  Text("\(Int(store.watermarkSpacing))px")
-                    .font(.system(size: 11))
-                    .frame(width: 45, alignment: .trailing)
-                }
-                
-                if store.watermarkTilePattern == "random" {
-                  HStack {
-                    Text("Chaos:")
-                    Slider(value: Binding(
-                      get: { store.watermarkTileRandomness },
-                      set: { store.watermarkTileRandomness = $0; store.save() }
-                    ), in: 0...1)
-                    Text(String(format: "%.0f%%", store.watermarkTileRandomness * 100))
-                      .frame(width: 40, alignment: .trailing)
-                  }
-                }
-              }
-              .font(.system(size: 11))
-            }
-          }
-        }
-        .frame(width: 260)
-        
-        Spacer()
-        
-        VStack {
-          WatermarkPreviewView(
-            layoutMode: store.watermarkLayoutMode,
-            textEnabled: store.watermarkTextEnabled,
-            text: store.watermarkText,
-            textColor: store.watermarkTextColor,
-            logoEnabled: store.watermarkLogoEnabled,
-            logoPath: store.watermarkLogoPath,
-            opacity: store.watermarkOpacity,
-            position: store.watermarkPosition,
-            logoSize: store.watermarkSize,
-            spacing: store.watermarkSpacing,
-            tilePattern: store.watermarkTilePattern,
-            tileRandomness: store.watermarkTileRandomness
-          )
-          Spacer()
-        }
-        .padding(.top, 4)
-      }
-    }
-  }
-  
-  private var storageTab: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      sectionHeader(title: "Storage & Cache", icon: "folder.fill", color: .orange)
-      
-      SettingsCard {
-        Text("Save Location")
-          .font(.system(size: 12, weight: .bold))
-        
-        HStack {
-          TextField("Default Pictures Folder", text: Binding(
-            get: { store.saveDirectory.isEmpty ? "Default (Pictures/QPARK Shot)" : store.saveDirectory },
-            set: { _ in }
-          ))
-          .textFieldStyle(.roundedBorder)
-          .disabled(true)
-          
-          Button("Browse...") {
-            let panel = NSOpenPanel()
-            panel.canChooseFiles = false
-            panel.canChooseDirectories = true
-            panel.allowsMultipleSelection = false
-            if panel.runModal() == .OK {
-              store.saveDirectory = panel.url?.path ?? ""
-              store.save()
-            }
-          }
-        }
-      }
-      
-      SettingsCard {
-        Picker("Cleanup Policy:", selection: Binding(
-          get: { store.cleanupMode },
-          set: { store.cleanupMode = $0; store.save() }
-        )) {
-          Text("Never Delete").tag("never")
-          Text("Delete After Duration").tag("afterDuration")
-        }
-        .pickerStyle(.menu)
-        
-        if store.cleanupMode == "afterDuration" {
-          Divider()
-          
-          VStack(alignment: .leading, spacing: 8) {
-            HStack {
-              Text("Keep Screenshots for:")
-              Slider(value: Binding(
-                get: { store.cleanupDurationHours },
-                set: { store.cleanupDurationHours = $0; store.save() }
-              ), in: 1...168)
-              Text("\(Int(store.cleanupDurationHours)) hours")
-                .frame(width: 80, alignment: .trailing)
-            }
-            
-            Toggle("Include manually saved files in cleanup", isOn: Binding(
-              get: { store.cleanupIncludeSaved },
-              set: { store.cleanupIncludeSaved = $0; store.save() }
-            ))
-            .toggleStyle(.checkbox)
-          }
-          .font(.system(size: 11))
-        }
-      }
-    }
-  }
-  
-  private var aboutTab: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      sectionHeader(title: "About QPARK Shot", icon: "info.circle.fill", color: .gray)
-      
-      SettingsCard {
-        VStack(alignment: .center, spacing: 10) {
-          Spacer().frame(height: 6)
-          Image(systemName: "viewfinder.circle.fill")
-            .font(.system(size: 54))
-            .foregroundColor(.accentColor)
-          
-          Text("QPARK Shot")
-            .font(.system(size: 18, weight: .bold))
-          
-          Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0")")
-            .font(.system(size: 11))
-            .foregroundColor(.secondary)
-          
-          Link("QPARK.IO", destination: URL(string: "https://qpark.io")!)
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(.accentColor)
-          
-          Text("A professional screenshots workspace utility.")
-            .font(.system(size: 12))
-            .foregroundColor(.secondary)
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 20)
-          
-          Divider()
-          
-          Text("Copyright © 2026 QPARK. All rights reserved.")
-            .font(.system(size: 9))
-            .foregroundColor(.secondary)
-          Spacer().frame(height: 6)
-        }
-        .frame(maxWidth: .infinity)
-      }
-    }
+  private var systemImage: String {
+    section == .recent ? "clock" : "photo.on.rectangle.angled"
   }
 }
 
-// MARK: - Shot Queue Sidebar
-
-struct ShotQueueSidebar: View {
+private struct SessionOverviewView: View {
+  @ObservedObject var store: WorkspaceStore
   @ObservedObject private var queue = ShotQueueStore.shared
-  @ObservedObject private var settings = SettingsStore.shared
-  @State private var thumbnails: [UUID: NSImage] = [:]
-  @State private var pendingThumbnails: Set<UUID> = []
-  @State private var queuePreviewItem: ShotQueueItem? = nil
-  @State private var queuePreviewImage: NSImage? = nil
-  @State private var queuePreviewError: String? = nil
-  @State private var queuePreviewIsRendering = false
-  @State private var queuePreviewRequestID = UUID()
+  @ObservedObject private var drafts = EditorDraftStore.shared
 
   var body: some View {
-    VStack(spacing: 0) {
-      // Header
-      HStack(spacing: 6) {
-        Image(systemName: "tray.full")
-          .font(.system(size: 11, weight: .semibold))
-          .foregroundColor(.accentColor)
-        Text("Buffer · \(queue.items.count)")
-          .font(.system(size: 11, weight: .semibold))
-        Spacer()
-        if !queue.items.isEmpty {
-          Button(action: clearAllWithConfirm) {
-            Image(systemName: "trash")
-              .font(.system(size: 10, weight: .semibold))
-          }
-          .buttonStyle(.plain)
-          .help("Clear buffer")
+    if queue.items.isEmpty {
+      ContentUnavailableView {
+        Label(localized("workspace.empty_session"), systemImage: "tray")
+      } actions: {
+        Button {
+          AppDelegate.shared.triggerCaptureFlow()
+        } label: {
+          Label(localized("workspace.capture_cta"), systemImage: "camera.viewfinder")
         }
-      }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 8)
-
-      Divider()
-
-      // Carousel
-      ScrollView {
-        LazyVStack(spacing: 8) {
-          ForEach(queue.items) { item in
-            ShotQueueThumbnail(
-              item: item,
-              isActive: item.id == queue.activeID,
-              thumbnail: thumbnails[item.id],
-              canPreviewWatermark: settings.watermarkTextEnabled || settings.watermarkLogoEnabled,
-              onLoad: { loadThumbnailIfNeeded(item: item) },
-              onOpen: {
-                MainWindowNavigation.shared.openEditor(itemID: item.id)
-                queue.activeID = item.id
-              },
-              onPreviewWatermark: { renderWatermarkPreview(item: item) },
-              onDelete: { delete(item: item) }
-            )
-          }
-        }
-        .padding(8)
-      }
-    }
-    .frame(maxHeight: .infinity)
-    .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
-    .overlay {
-      if queuePreviewItem != nil {
-        ExportPreviewOverlay(
-          image: queuePreviewImage,
-          isRendering: queuePreviewIsRendering,
-          errorMessage: queuePreviewError,
-          onClose: closeWatermarkPreview
-        )
-        .transition(.opacity)
-      }
-    }
-  }
-
-  private func loadThumbnailIfNeeded(item: ShotQueueItem) {
-    guard thumbnails[item.id] == nil, !pendingThumbnails.contains(item.id) else { return }
-    pendingThumbnails.insert(item.id)
-    let path = item.path
-    let id = item.id
-    DispatchQueue.global(qos: .utility).async {
-      let thumb = makeThumbnailImage(path: path, maxPixelSize: 240)
-      DispatchQueue.main.async {
-        pendingThumbnails.remove(id)
-        guard queue.item(for: id) != nil else { return }
-        if let thumb {
-          thumbnails[id] = thumb
-        }
-      }
-    }
-  }
-
-  private func delete(item: ShotQueueItem) {
-    let wasActive = (item.id == queue.activeID)
-    let nextID = queue.remove(item.id)
-    thumbnails.removeValue(forKey: item.id)
-    pendingThumbnails.remove(item.id)
-    if wasActive {
-      if let nextID {
-        MainWindowNavigation.shared.openEditor(itemID: nextID)
-      } else {
-        MainWindowNavigation.shared.showGallery()
-      }
-    }
-  }
-
-  private func clearAllWithConfirm() {
-    let alert = NSAlert()
-    alert.messageText = "Clear screenshot buffer?"
-    alert.informativeText = "All \(queue.items.count) screenshots will be removed from the buffer. Files saved to your Pictures folder are not affected."
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: "Clear")
-    alert.addButton(withTitle: "Cancel")
-    if alert.runModal() == .alertFirstButtonReturn {
-      queue.clearAll()
-      thumbnails.removeAll()
-      pendingThumbnails.removeAll()
-      MainWindowNavigation.shared.showGallery()
-    }
-  }
-
-  private func renderWatermarkPreview(item: ShotQueueItem) {
-    let requestID = UUID()
-    queuePreviewRequestID = requestID
-    queuePreviewItem = item
-    queuePreviewImage = nil
-    queuePreviewError = nil
-    queuePreviewIsRendering = true
-
-    let path = item.path
-    let watermarkSnapshot = WatermarkRenderSettings.current()
-    DispatchQueue.global(qos: .userInitiated).async {
-      let rendered: NSImage?
-      if let img = loadImageForRendering(path: path) {
-        rendered = renderAnnotatedImage(
-          image: img,
-          annotations: [],
-          cropRect: nil,
-          watermark: watermarkSnapshot
-        )
-      } else {
-        rendered = nil
-      }
-      DispatchQueue.main.async {
-        guard queuePreviewRequestID == requestID else { return }
-        queuePreviewIsRendering = false
-        if let rendered {
-          queuePreviewImage = rendered
-        } else {
-          queuePreviewError = "Could not render preview."
-        }
-      }
-    }
-  }
-
-  private func closeWatermarkPreview() {
-    queuePreviewRequestID = UUID()
-    queuePreviewIsRendering = false
-    queuePreviewItem = nil
-    queuePreviewImage = nil
-  }
-}
-
-struct ShotQueueThumbnail: View {
-  let item: ShotQueueItem
-  let isActive: Bool
-  let thumbnail: NSImage?
-  let canPreviewWatermark: Bool
-  let onLoad: () -> Void
-  let onOpen: () -> Void
-  let onPreviewWatermark: () -> Void
-  let onDelete: () -> Void
-
-  @State private var isHovered = false
-
-  private static let timeFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
-    return f
-  }()
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 3) {
-      ZStack(alignment: .topTrailing) {
-        Group {
-          if let thumbnail {
-            Image(nsImage: thumbnail)
-              .resizable()
-              .aspectRatio(contentMode: .fill)
-          } else {
-            ZStack {
-              Color.gray.opacity(0.28)
-              ProgressView().controlSize(.small)
-            }
-          }
-        }
-        .frame(width: 104, height: 66)
-        .clipped()
-        .clipShape(RoundedRectangle(cornerRadius: 5))
-        .overlay(
-          RoundedRectangle(cornerRadius: 5)
-            .stroke(isActive ? Color.accentColor : Color.white.opacity(0.06),
-                    lineWidth: isActive ? 2 : 1)
-        )
-
-        if isHovered {
-          Color.black.opacity(0.32)
-            .clipShape(RoundedRectangle(cornerRadius: 5))
-
-          HStack(spacing: 4) {
-            if canPreviewWatermark {
-              Button(action: onPreviewWatermark) {
-                Image(systemName: "eye")
-                  .font(.system(size: 9, weight: .bold))
-                  .foregroundColor(.white)
-                  .padding(4)
-                  .background(Color.black.opacity(0.55))
-                  .clipShape(Circle())
-              }
-              .buttonStyle(.plain)
-              .help("Preview with watermark")
-            }
-
-            Button(action: onDelete) {
-              Image(systemName: "trash")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundColor(.white)
-                .padding(4)
-                .background(Color.red)
-                .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help("Remove from buffer")
-          }
-          .padding(4)
-        }
-      }
-      .onAppear(perform: onLoad)
-      .onHover { isHovered = $0 }
-      .onTapGesture(perform: onOpen)
-      .onDrag {
-        let url = URL(fileURLWithPath: item.path)
-        let provider = NSItemProvider()
-        provider.suggestedName = url.lastPathComponent
-        provider.registerFileRepresentation(
-          forTypeIdentifier: "public.png",
-          fileOptions: [],
-          visibility: .all
-        ) { completion in
-          completion(url, true, nil)
-          return nil
-        }
-        return provider
-      }
-      .contextMenu {
-        Button("Open", action: onOpen)
-        if canPreviewWatermark {
-          Button("Preview with watermark", action: onPreviewWatermark)
-        }
-        Divider()
-        Button("Remove from buffer", role: .destructive, action: onDelete)
-      }
-
-      Text(Self.timeFormatter.string(from: item.capturedAt))
-        .font(.system(size: 9))
-        .foregroundColor(.secondary)
-        .frame(width: 104, alignment: .leading)
-    }
-  }
-}
-
-// MARK: - Editor View
-struct EditorView: View {
-  let itemID: UUID
-  var onClose: () -> Void = {}
-  var onSave: () -> Void
-
-  @ObservedObject private var queue = ShotQueueStore.shared
-  @ObservedObject private var settings = SettingsStore.shared
-
-  @State private var image: NSImage? = nil
-  @State private var annotations: [Annotation] = []
-  @State private var undoStack: [[Annotation]] = []
-  @State private var redoStack: [[Annotation]] = []
-
-  @State private var tool: ToolType = .freehand
-  @State private var color: Color = .red
-  @State private var strokeWidth: CGFloat = 4.0
-  @State private var textInput: String = "Text Annotation"
-  @State private var cropRect: CGRect? = nil
-  @State private var previewImage: NSImage? = nil
-  @State private var previewError: String? = nil
-  @State private var isPreviewRendering = false
-  @State private var isPreviewPresented = false
-  @State private var previewRequestID = UUID()
-  @State private var imageLoadRequestID = UUID()
-  @State private var exportRequestID = UUID()
-  @State private var isExporting = false
-
-  private var imagePath: String {
-    queue.item(for: itemID)?.path ?? ""
-  }
-  
-  var body: some View {
-    HStack(spacing: 0) {
-      if settings.queuePanelEnabled && !queue.items.isEmpty {
-        ShotQueueSidebar()
-          .frame(width: 124)
-          .transition(.move(edge: .leading).combined(with: .opacity))
-        Divider()
-      }
-      editorContent
-    }
-    .animation(.easeInOut(duration: 0.18), value: settings.queuePanelEnabled)
-    .animation(.easeInOut(duration: 0.18), value: queue.items.count)
-  }
-
-  private var editorContent: some View {
-    VStack(spacing: 0) {
-      // Editor Toolbar
-      HStack(spacing: 12) {
-        Button(action: onClose) {
-          Image(systemName: "chevron.left")
-        }
-        .help("Back to Gallery")
-        
-        Picker("Tool", selection: $tool) {
-          Image(systemName: "crop").tag(ToolType.select)
-          Image(systemName: "scribble").tag(ToolType.freehand)
-          Image(systemName: "arrow.up.forward").tag(ToolType.arrow)
-          Image(systemName: "square").tag(ToolType.rectangle)
-          Image(systemName: "textformat").tag(ToolType.text)
-        }
-        .pickerStyle(.segmented)
-        .frame(width: 200)
-        
-        ColorPicker("", selection: $color)
-        
-        Picker("Size", selection: $strokeWidth) {
-          Text("Thin").tag(CGFloat(2.0))
-          Text("Medium").tag(CGFloat(4.0))
-          Text("Thick").tag(CGFloat(8.0))
-          Text("Heavy").tag(CGFloat(14.0))
-        }
-        .frame(width: 90)
-        
-        if tool == .text {
-          TextField("Text", text: $textInput)
-            .textFieldStyle(.roundedBorder)
-            .frame(width: 140)
-        }
-        
-        Spacer()
-        
-        Button(action: undo) {
-          Image(systemName: "arrow.uturn.backward")
-        }
-        .disabled(undoStack.isEmpty)
-        .help("Undo")
-        
-        Button(action: redo) {
-          Image(systemName: "arrow.uturn.forward")
-        }
-        .disabled(redoStack.isEmpty)
-        .help("Redo")
-        
-        Divider().frame(height: 24)
-        
-        if isExporting {
-          ProgressView()
-            .controlSize(.small)
-            .help("Exporting")
-        }
-        
-        Button(action: showPreview) {
-          Image(systemName: "eye")
-        }
-        .disabled(image == nil || isExporting)
-        .help("Preview with Watermarks")
-        
-        Button(action: copyToClipboard) {
-          Image(systemName: "doc.on.doc")
-        }
-        .disabled(image == nil || isExporting)
-        .help("Copy to Clipboard")
-        
-        Button(action: shareImage) {
-          Image(systemName: "square.and.arrow.up")
-        }
-        .disabled(image == nil || isExporting)
-        .help("Share")
-        
-        Button(action: saveImageToFile) {
-          HStack {
-            Image(systemName: "square.and.arrow.down")
-            Text("Save")
-          }
-        }
-        .disabled(image == nil || isExporting)
         .buttonStyle(.borderedProminent)
+        .disabled(store.isCapturing)
       }
-      .padding(.top, 8)
-      .padding(.horizontal, 12)
-      .padding(.bottom, 8)
-      .background(Color.clear)
-      
-      Divider()
-      
-      // Editor Canvas
-      GeometryReader { geo in
-        if let img = image {
-          ZStack {
-            DrawingCanvas(
-              image: img,
-              annotations: $annotations,
-              currentTool: $tool,
-              currentColor: $color,
-              currentStrokeWidth: $strokeWidth,
-              textInput: $textInput,
-              cropRect: $cropRect,
-              onAction: {
-                recordUndo()
-              }
+    } else {
+      ScrollView {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 190, maximum: 260), spacing: 14)], spacing: 14) {
+          ForEach(queue.items) { item in
+            SessionItemTile(
+              item: item,
+              onOpen: { store.showCaptureReview(itemID: item.id) },
+              onEdit: { store.openEditor(itemID: item.id) },
+              onRemove: {
+                _ = queue.remove(item.id)
+                EditorDraftStore.shared.remove(item.id)
+                store.showCurrentSession()
+              },
+              isDirty: drafts.draft(for: item.id).isDirty
             )
           }
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-          ProgressView()
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .padding(18)
       }
     }
-    .background(VisualEffectView(material: .hudWindow, blendingMode: .behindWindow))
-    .frame(minWidth: 800, minHeight: 550)
-    .onAppear {
-      loadEditorImage()
+  }
+}
+
+private struct SessionItemTile: View {
+  let item: ShotQueueItem
+  let onOpen: () -> Void
+  let onEdit: () -> Void
+  let onRemove: () -> Void
+  let isDirty: Bool
+
+  @State private var thumbnail: NSImage?
+  @State private var confirmsRemove = false
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      ImagePreview(image: thumbnail, cornerRadius: 8)
+        .aspectRatio(1.55, contentMode: .fit)
+      Text(item.capturedAt, style: .time)
+        .font(.caption.weight(.medium))
+      HStack(spacing: 8) {
+        Button(localized("common.open"), action: onOpen)
+        Button(localized("common.edit"), action: onEdit)
+        Spacer()
+        Button(role: .destructive) {
+          if isDirty {
+            confirmsRemove = true
+          } else {
+            onRemove()
+          }
+        } label: {
+          Image(systemName: "trash")
+        }
+        .accessibilityLabel(localized("common.delete"))
+      }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
     }
-    .onChange(of: itemID) { _ in
-      loadEditorImage()
+    .padding(10)
+    .background(Color.primary.opacity(0.05))
+    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .onAppear(perform: loadThumbnail)
+    .confirmationDialog(
+      localized("workspace.clear_session_title"),
+      isPresented: $confirmsRemove
+    ) {
+      Button(localized("common.delete"), role: .destructive, action: onRemove)
+      Button(localized("common.cancel"), role: .cancel) {}
+    } message: {
+      Text(localized("workspace.unsaved_draft_warning"))
     }
-    .overlay {
-      if isPreviewPresented {
-        ExportPreviewOverlay(
-          image: previewImage,
-          isRendering: isPreviewRendering,
-          errorMessage: previewError,
-          onClose: closePreview
-        )
-        .transition(.opacity)
+  }
+
+  private func loadThumbnail() {
+    guard thumbnail == nil else { return }
+    DispatchQueue.global(qos: .utility).async {
+      let image = makeThumbnailImage(path: item.path, maxPixelSize: 560)
+      DispatchQueue.main.async {
+        thumbnail = image
+      }
+    }
+  }
+}
+
+private struct CaptureReviewView: View {
+  let itemID: UUID
+  @ObservedObject var store: WorkspaceStore
+  @ObservedObject private var queue = ShotQueueStore.shared
+  @ObservedObject private var settings = SettingsStore.shared
+  @State private var image: NSImage?
+  @State private var previewImage: NSImage?
+  @State private var isBusy = false
+  @State private var previewRequestID = UUID()
+
+  private var item: ShotQueueItem? {
+    queue.item(for: itemID)
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack {
+        Label(localized("review.captured"), systemImage: "checkmark.circle.fill")
+          .font(.system(size: 14, weight: .semibold))
+          .foregroundColor(.green)
+        Spacer()
+        Button {
+          store.showSessionOverview()
+        } label: {
+          Image(systemName: "xmark")
+        }
+        .help(localized("common.close"))
+      }
+      .padding(14)
+
+      Divider()
+
+      VStack(spacing: 16) {
+        ImagePreview(image: previewImage ?? image, cornerRadius: 10)
+          .frame(maxWidth: 760, maxHeight: 430)
+
+        HStack(spacing: 10) {
+          Button {
+            copy()
+          } label: {
+            Label(localized("common.copy"), systemImage: "doc.on.doc")
+          }
+          .buttonStyle(.borderedProminent)
+          .accessibilityIdentifier("review.copy")
+
+          Button {
+            if let item {
+              store.openEditor(itemID: item.id)
+            }
+          } label: {
+            Label(localized("settings.open_editor"), systemImage: "pencil.and.outline")
+          }
+
+          Button {
+            save()
+          } label: {
+            Label(localized("common.save"), systemImage: "square.and.arrow.down")
+          }
+
+          Button {
+            share()
+          } label: {
+            Label(localized("common.share"), systemImage: "square.and.arrow.up")
+          }
+
+          Button {
+            pin()
+          } label: {
+            Label(localized("common.pin"), systemImage: "pin")
+          }
+        }
+        .buttonStyle(.bordered)
+        .disabled(isBusy || item == nil)
+      }
+      .padding(20)
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+      if shouldShowSessionStrip(isEnabled: settings.queuePanelEnabled, itemCount: queue.items.count) {
+        Divider()
+        SessionStrip(activeID: itemID, store: store, action: .review)
+          .frame(height: 88)
+      }
+    }
+    .onAppear(perform: loadImage)
+    .onReceive(settings.objectWillChange) { _ in
+      DispatchQueue.main.async {
+        renderPreview()
       }
     }
   }
 
-  private func recordUndo() {
-    undoStack.append(annotations)
-    redoStack.removeAll()
-  }
-  
-  private func loadEditorImage() {
-    let requestID = UUID()
-    imageLoadRequestID = requestID
-    image = nil
-    annotations = []
-    undoStack = []
-    redoStack = []
-    cropRect = nil
-    
-    let imagePathSnapshot = imagePath
+  private func loadImage() {
+    guard let path = item?.path else { return }
     DispatchQueue.global(qos: .userInitiated).async {
-      let loadedImage = loadImageForRendering(path: imagePathSnapshot)
+      let loaded = loadImageForRendering(path: path)
       DispatchQueue.main.async {
-        guard imageLoadRequestID == requestID else { return }
-        image = loadedImage
-        if loadedImage != nil {
-          recordUndo()
-        }
+        image = loaded
+        renderPreview()
       }
     }
   }
-  
-  private func undo() {
-    guard undoStack.count > 1 else { return }
-    let current = undoStack.removeLast()
-    redoStack.append(current)
-    annotations = undoStack.last ?? []
-  }
-  
-  private func redo() {
-    guard let next = redoStack.popLast() else { return }
-    undoStack.append(next)
-    annotations = next
-  }
-  
-  private func showPreview() {
-    guard image != nil else { return }
+
+  private func renderPreview() {
+    guard let image else {
+      previewImage = nil
+      return
+    }
     let requestID = UUID()
     previewRequestID = requestID
-    previewImage = nil
-    previewError = nil
-    isPreviewRendering = true
-    isPreviewPresented = true
-    
-    let imagePathSnapshot = imagePath
-    let annotationsSnapshot = annotations
-    let cropSnapshot = cropRect
-    let watermarkSnapshot = WatermarkRenderSettings.current()
-    
+    let preset = ExportPreset.preset(for: SettingsStore.shared.exportPresetID)
+    let watermark = WatermarkRenderSettings.current()
     DispatchQueue.global(qos: .userInitiated).async {
-      let renderedImage: NSImage?
-      if let renderImage = loadImageForRendering(path: imagePathSnapshot) {
-        renderedImage = renderAnnotatedImage(
-          image: renderImage,
-          annotations: annotationsSnapshot,
-          cropRect: cropSnapshot,
-          watermark: watermarkSnapshot
+      let rendered = ExportService.shared.render(
+        ExportContext(
+          image: image,
+          annotations: [],
+          cropRect: nil,
+          preset: preset,
+          watermark: watermark
         )
-      } else {
-        renderedImage = nil
-      }
-      
+      )
       DispatchQueue.main.async {
         guard previewRequestID == requestID else { return }
-        isPreviewRendering = false
-        if let renderedImage {
-          previewImage = renderedImage
-        } else {
-          previewError = "Could not render preview."
-        }
+        previewImage = rendered
       }
     }
   }
-  
-  private func closePreview() {
-    previewRequestID = UUID()
-    isPreviewRendering = false
-    isPreviewPresented = false
+
+  private func save() {
+    exportFinal(isTemporary: false) { savedPath in
+      if savedPath != nil {
+        store.presentStatus(localized("review.saved"), kind: .success)
+        store.loadLibrary()
+      } else {
+        store.presentStatus(localized("review.save_failed"), kind: .error)
+      }
+    }
   }
-  
-  private func copyToClipboard() {
-    renderExportedImageInBackground { finalImg in
-      guard let finalImg else { return }
+
+  private func copy() {
+    guard let image else { return }
+    exportRenderedImage(from: image) { rendered in
+      isBusy = false
+      guard let rendered else {
+        store.presentStatus(localized("status.copy_failed"), kind: .error)
+        return
+      }
       let pasteboard = NSPasteboard.general
       pasteboard.clearContents()
-      pasteboard.writeObjects([finalImg])
+      pasteboard.writeObjects([rendered])
+      store.presentStatus(localized("review.copied"), kind: .success)
     }
   }
-  
-  private func shareImage() {
-    saveExportedImageInBackground(isTemporary: true) { path in
-      guard let path else { return }
-      let url = URL(fileURLWithPath: path)
-      let picker = NSSharingServicePicker(items: [url])
-      if let window = NSApp.keyWindow, let contentView = window.contentView {
-        let rect = NSRect(x: contentView.bounds.midX, y: contentView.bounds.midY, width: 1, height: 1)
-        picker.show(relativeTo: rect, of: contentView, preferredEdge: .minY)
+
+  private func share() {
+    exportFinal(isTemporary: true) { savedPath in
+      if let savedPath {
+        store.share(path: savedPath)
       }
     }
   }
-  
-  private func saveImageToFile() {
-    saveExportedImageInBackground(isTemporary: false) { path in
-      if path != nil {
-        onSave()
+
+  private func pin() {
+    exportFinal(isTemporary: true) { savedPath in
+      if let savedPath {
+        store.pin(path: savedPath)
       }
     }
   }
-  
-  private func renderExportedImageInBackground(completion: @escaping (NSImage?) -> Void) {
-    guard image != nil, !isExporting else { return }
-    let requestID = UUID()
-    exportRequestID = requestID
-    isExporting = true
-    
-    let imagePathSnapshot = imagePath
-    let annotationsSnapshot = annotations
-    let cropSnapshot = cropRect
-    let watermarkSnapshot = WatermarkRenderSettings.current()
-    
+
+  private func exportFinal(isTemporary: Bool, completion: @escaping (String?) -> Void) {
+    guard let image else {
+      completion(nil)
+      return
+    }
+    isBusy = true
+    let preset = ExportPreset.preset(for: SettingsStore.shared.exportPresetID)
+    let template = SettingsStore.shared.filenameTemplate
+    let watermark = WatermarkRenderSettings.current()
     DispatchQueue.global(qos: .userInitiated).async {
-      let renderedImage: NSImage?
-      if let renderImage = loadImageForRendering(path: imagePathSnapshot) {
-        renderedImage = renderAnnotatedImage(
-          image: renderImage,
-          annotations: annotationsSnapshot,
-          cropRect: cropSnapshot,
-          watermark: watermarkSnapshot
+      let savedPath = ExportService.shared.save(
+        context: ExportContext(
+          image: image,
+          annotations: [],
+          cropRect: nil,
+          preset: preset,
+          watermark: watermark
+        ),
+        isTemporary: isTemporary,
+        filenameTemplate: template
+      )
+      DispatchQueue.main.async {
+        isBusy = false
+        completion(savedPath)
+      }
+    }
+  }
+
+  private func exportRenderedImage(from image: NSImage, completion: @escaping (NSImage?) -> Void) {
+    isBusy = true
+    let preset = ExportPreset.preset(for: SettingsStore.shared.exportPresetID)
+    let watermark = WatermarkRenderSettings.current()
+    DispatchQueue.global(qos: .userInitiated).async {
+      let rendered = ExportService.shared.render(
+        ExportContext(
+          image: image,
+          annotations: [],
+          cropRect: nil,
+          preset: preset,
+          watermark: watermark
         )
-      } else {
-        renderedImage = nil
-      }
-      
+      )
       DispatchQueue.main.async {
-        guard exportRequestID == requestID else { return }
-        isExporting = false
-        completion(renderedImage)
+        completion(rendered)
       }
     }
   }
-  
-  private func saveExportedImageInBackground(isTemporary: Bool, completion: @escaping (String?) -> Void) {
-    guard image != nil, !isExporting else { return }
-    let requestID = UUID()
-    exportRequestID = requestID
-    isExporting = true
-    
-    let imagePathSnapshot = imagePath
-    let annotationsSnapshot = annotations
-    let cropSnapshot = cropRect
-    let watermarkSnapshot = WatermarkRenderSettings.current()
-    
-    DispatchQueue.global(qos: .userInitiated).async {
-      let savedPath: String?
-      if let renderImage = loadImageForRendering(path: imagePathSnapshot),
-         let renderedImage = renderAnnotatedImage(
-          image: renderImage,
-          annotations: annotationsSnapshot,
-          cropRect: cropSnapshot,
-          watermark: watermarkSnapshot
-         ) {
-        savedPath = saveImage(image: renderedImage, isTemporary: isTemporary)
-      } else {
-        savedPath = nil
+}
+
+private struct EditorWorkspaceView: View {
+  let itemID: UUID
+  @ObservedObject var store: WorkspaceStore
+  @ObservedObject private var queue = ShotQueueStore.shared
+  @ObservedObject private var drafts = EditorDraftStore.shared
+  @ObservedObject private var settings = SettingsStore.shared
+
+  @State private var image: NSImage?
+  @State private var annotations: [Annotation] = []
+  @State private var cropRect: CGRect?
+  @State private var currentTool: ToolType = .arrow
+  @State private var currentColor: Color = .red
+  @State private var currentStrokeWidth: CGFloat = 4
+  @State private var textInput: String = ""
+  @State private var isExporting = false
+
+  private var item: ShotQueueItem? {
+    queue.item(for: itemID)
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      editorToolbar
+      Divider()
+      HStack(spacing: 0) {
+        ZStack {
+          Color.black.opacity(0.84)
+          if let image {
+            DrawingCanvas(
+              image: image,
+              annotations: $annotations,
+              currentTool: $currentTool,
+              currentColor: $currentColor,
+              currentStrokeWidth: $currentStrokeWidth,
+              textInput: $textInput,
+              cropRect: $cropRect,
+              onAction: recordDraft
+            )
+            .padding(18)
+          } else {
+            ProgressView()
+          }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+        EditorControls(
+          currentTool: $currentTool,
+          currentColor: $currentColor,
+          currentStrokeWidth: $currentStrokeWidth,
+          textInput: $textInput,
+          hasCrop: cropRect != nil,
+          onClearCrop: {
+            cropRect = nil
+            recordDraft()
+          }
+        )
+        .frame(width: 250)
       }
-      
+      if shouldShowSessionStrip(isEnabled: settings.queuePanelEnabled, itemCount: queue.items.count) {
+        Divider()
+        SessionStrip(activeID: itemID, store: store)
+          .frame(height: 96)
+      }
+    }
+    .onAppear(perform: loadState)
+    .onChange(of: itemID) {
+      loadState()
+    }
+  }
+
+  private var editorToolbar: some View {
+    HStack(spacing: 8) {
+      Button {
+        store.showSessionOverview()
+      } label: {
+        Label(localized("common.back"), systemImage: "chevron.left")
+      }
+      .buttonStyle(.bordered)
+
+      Divider()
+        .frame(height: 20)
+
+      Button(action: undo) {
+        Image(systemName: "arrow.uturn.backward")
+      }
+      .keyboardShortcut("z", modifiers: .command)
+      .accessibilityLabel(localized("editor.undo"))
+      .accessibilityIdentifier("editor.undo")
+      .help(localized("editor.undo"))
+      .disabled(drafts.draft(for: itemID).undoStack.count <= 1)
+
+      Button(action: redo) {
+        Image(systemName: "arrow.uturn.forward")
+      }
+      .keyboardShortcut("z", modifiers: [.command, .shift])
+      .accessibilityLabel(localized("editor.redo"))
+      .accessibilityIdentifier("editor.redo")
+      .help(localized("editor.redo"))
+      .disabled(drafts.draft(for: itemID).redoStack.isEmpty)
+
+      Spacer()
+
+      Button(action: copyFinal) {
+        Label(localized("common.copy"), systemImage: "doc.on.doc")
+      }
+      Button(action: shareFinal) {
+        Label(localized("common.share"), systemImage: "square.and.arrow.up")
+      }
+      Button(action: pinFinal) {
+        Label(localized("common.pin"), systemImage: "pin")
+      }
+      Button(action: saveFinal) {
+        Label(localized("common.save"), systemImage: "square.and.arrow.down")
+      }
+      .buttonStyle(.borderedProminent)
+      .keyboardShortcut("s", modifiers: .command)
+      .accessibilityIdentifier("editor.save")
+    }
+    .buttonStyle(.bordered)
+    .disabled(isExporting)
+    .padding(.horizontal, 14)
+    .padding(.vertical, 9)
+  }
+
+  private func loadState() {
+    guard let item else { return }
+    let draft = drafts.draft(for: itemID)
+    annotations = draft.annotations
+    cropRect = draft.cropRect
+    DispatchQueue.global(qos: .userInitiated).async {
+      let loaded = loadImageForRendering(path: item.path)
       DispatchQueue.main.async {
-        guard exportRequestID == requestID else { return }
+        image = loaded
+      }
+    }
+  }
+
+  private func recordDraft() {
+    drafts.recordAnnotations(annotations, cropRect: cropRect, for: itemID)
+  }
+
+  private func undo() {
+    drafts.update(itemID) { draft in
+      guard draft.undoStack.count > 1 else { return }
+      let current = draft.undoStack.removeLast()
+      draft.redoStack.append(current)
+      let previous = draft.undoStack.last ?? []
+      draft.annotations = previous
+      draft.isDirty = true
+      annotations = previous
+    }
+  }
+
+  private func redo() {
+    drafts.update(itemID) { draft in
+      guard let next = draft.redoStack.popLast() else { return }
+      draft.undoStack.append(next)
+      draft.annotations = next
+      draft.isDirty = true
+      annotations = next
+    }
+  }
+
+  private func saveFinal() {
+    exportFinal(isTemporary: false) { savedPath in
+      if savedPath != nil {
+        drafts.markSaved(itemID)
+        store.presentStatus(localized("editor.saved"), kind: .success)
+        store.loadLibrary()
+      } else {
+        store.presentStatus(localized("review.save_failed"), kind: .error)
+      }
+    }
+  }
+
+  private func copyFinal() {
+    guard let image = image else { return }
+    isExporting = true
+    let annotations = annotations
+    let cropRect = cropRect
+    DispatchQueue.global(qos: .userInitiated).async {
+      let rendered = ExportService.shared.render(
+        ExportContext(
+          image: image,
+          annotations: annotations,
+          cropRect: cropRect,
+          preset: ExportPreset.preset(for: SettingsStore.shared.exportPresetID),
+          watermark: WatermarkRenderSettings.current()
+        )
+      )
+      DispatchQueue.main.async {
+        isExporting = false
+        guard let rendered else {
+          store.presentStatus(localized("status.copy_failed"), kind: .error)
+          return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([rendered])
+        store.presentStatus(localized("review.copied"), kind: .success)
+      }
+    }
+  }
+
+  private func shareFinal() {
+    exportFinal(isTemporary: true) { savedPath in
+      if let savedPath {
+        store.share(path: savedPath)
+      }
+    }
+  }
+
+  private func pinFinal() {
+    exportFinal(isTemporary: true) { savedPath in
+      if let savedPath {
+        store.pin(path: savedPath)
+      }
+    }
+  }
+
+  private func exportFinal(isTemporary: Bool, completion: @escaping (String?) -> Void) {
+    guard let image else {
+      completion(nil)
+      return
+    }
+    isExporting = true
+    let annotations = annotations
+    let cropRect = cropRect
+    let preset = ExportPreset.preset(for: SettingsStore.shared.exportPresetID)
+    let template = SettingsStore.shared.filenameTemplate
+    DispatchQueue.global(qos: .userInitiated).async {
+      let savedPath = ExportService.shared.save(
+        context: ExportContext(
+          image: image,
+          annotations: annotations,
+          cropRect: cropRect,
+          preset: preset,
+          watermark: WatermarkRenderSettings.current()
+        ),
+        isTemporary: isTemporary,
+        filenameTemplate: template
+      )
+      DispatchQueue.main.async {
         isExporting = false
         completion(savedPath)
       }
@@ -2287,888 +1225,429 @@ struct EditorView: View {
   }
 }
 
-struct ExportPreviewOverlay: View {
-  let image: NSImage?
-  let isRendering: Bool
-  let errorMessage: String?
-  let onClose: () -> Void
-  
-  @State private var zoomScale: CGFloat = 1.0
-  
-  private let minZoom: CGFloat = 0.25
-  private let maxZoom: CGFloat = 4.0
-  
-  var body: some View {
-    GeometryReader { geo in
-      let overlaySize = CGSize(
-        width: max(geo.size.width - 24, 320),
-        height: max(geo.size.height - 24, 260)
-      )
-      
-      VStack(spacing: 0) {
-        HStack(spacing: 8) {
-          Label("Preview", systemImage: "eye")
-            .font(.system(size: 13, weight: .semibold))
-          
-          Spacer()
-          
-          if image != nil {
-            Button {
-              zoomScale = max(minZoom, zoomScale - 0.25)
-            } label: {
-              Image(systemName: "minus.magnifyingglass")
-            }
-            .disabled(zoomScale <= minZoom)
-            .help("Zoom out")
-            
-            Text("\(Int(zoomScale * 100))%")
-              .font(.system(size: 11, weight: .medium, design: .monospaced))
-              .frame(width: 44)
-              .foregroundColor(.secondary)
-            
-            Button {
-              zoomScale = min(maxZoom, zoomScale + 0.25)
-            } label: {
-              Image(systemName: "plus.magnifyingglass")
-            }
-            .disabled(zoomScale >= maxZoom)
-            .help("Zoom in")
-            
-            Button("Fit") {
-              zoomScale = 1.0
-            }
-            .help("Fit to window")
-          }
-          
-          Divider()
-            .frame(height: 22)
-          
-          Button("Done", action: onClose)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(VisualEffectView(material: .hudWindow, blendingMode: .withinWindow))
-        
-        Divider()
-        
-        ZStack {
-          if let image {
-            previewImage(image, in: overlaySize)
-          } else if isRendering {
-            VStack(spacing: 12) {
-              ProgressView()
-              Text("Rendering preview...")
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-          } else {
-            VStack(spacing: 12) {
-              Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 28))
-                .foregroundColor(.secondary)
-              Text(errorMessage ?? "Preview is unavailable.")
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-          }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.86))
-      }
-      .frame(width: overlaySize.width, height: overlaySize.height)
-      .clipShape(RoundedRectangle(cornerRadius: 8))
-      .shadow(color: .black.opacity(0.35), radius: 18, x: 0, y: 8)
-      .padding(12)
-    }
-    .background(Color.black.opacity(0.45))
-  }
-  
-  private func previewImage(_ image: NSImage, in containerSize: CGSize) -> some View {
-    let availableWidth = max(containerSize.width - 56, 100)
-    let availableHeight = max(containerSize.height - 104, 100)
-    let fitScale = min(
-      availableWidth / max(image.size.width, 1),
-      availableHeight / max(image.size.height, 1),
-      1
-    )
-    let displayScale = max(0.01, fitScale * zoomScale)
-    let displaySize = CGSize(
-      width: image.size.width * displayScale,
-      height: image.size.height * displayScale
-    )
-    
-    return ScrollView([.horizontal, .vertical]) {
-      Image(nsImage: image)
-        .resizable()
-        .interpolation(.high)
-        .aspectRatio(contentMode: .fit)
-        .frame(width: displaySize.width, height: displaySize.height)
-        .padding(20)
-        .frame(
-          minWidth: availableWidth,
-          minHeight: availableHeight,
-          alignment: .center
-        )
-    }
-  }
-}
-
-// MARK: - Drawing Canvas Elements
-enum ToolType {
-  case select, freehand, arrow, rectangle, text
-}
-
-struct Annotation: Identifiable, Equatable {
-  let id = UUID()
-  var type: ToolType
-  var color: Color
-  var strokeWidth: CGFloat
-  var points: [CGPoint] = []
-  var text: String = ""
-  var rect: CGRect = .zero
-  
-  static func == (lhs: Annotation, rhs: Annotation) -> Bool {
-    lhs.id == rhs.id
-  }
-}
-
-struct DrawingCanvas: View {
-  let image: NSImage
-  @Binding var annotations: [Annotation]
+private struct EditorControls: View {
   @Binding var currentTool: ToolType
   @Binding var currentColor: Color
   @Binding var currentStrokeWidth: CGFloat
   @Binding var textInput: String
-  @Binding var cropRect: CGRect?
-  let onAction: () -> Void
-  
-  @State private var currentPoints: [CGPoint] = []
-  @State private var dragStart: CGPoint?
-  @State private var dragCurrent: CGPoint?
+  let hasCrop: Bool
+  let onClearCrop: () -> Void
+
+  private let tools: [(ToolType, String, String)] = [
+    (.arrow, "editor.tool_arrow", "arrow.up.right"),
+    (.rectangle, "editor.tool_rectangle", "rectangle"),
+    (.freehand, "editor.tool_freehand", "scribble"),
+    (.text, "editor.tool_text", "textformat"),
+    (.callout, "editor.tool_callout", "number.circle"),
+    (.redact, "editor.tool_redact", "eye.slash"),
+    (.blur, "editor.tool_blur", "drop"),
+    (.select, "editor.tool_crop", "crop")
+  ]
 
   var body: some View {
-    GeometryReader { geo in
-      let imageRect = fittedImageRect(imageSize: image.size, in: geo.size)
-      let imageScale = imageRect.width / max(image.size.width, 1)
-      
-      ZStack {
+    VStack(alignment: .leading, spacing: 14) {
+      Text(localized("editor.tools"))
+        .font(.body.weight(.semibold))
+
+      LazyVGrid(columns: [GridItem(.adaptive(minimum: 44, maximum: 54), spacing: 8)], spacing: 8) {
+        ForEach(tools, id: \.1) { tool, key, icon in
+          Button {
+            currentTool = tool
+          } label: {
+            Image(systemName: icon)
+              .frame(width: 34, height: 28)
+          }
+          .buttonStyle(.bordered)
+          .help(localized(key))
+          .tint(currentTool == tool ? QPARKDesign.brandCyan : nil)
+          .accessibilityLabel(localized(key))
+          .accessibilityValue(currentTool == tool ? localized("status.selected") : "")
+        }
+      }
+
+      ColorPicker(localized("editor.color"), selection: $currentColor)
+
+      VStack(alignment: .leading) {
+        Text(localized("editor.stroke"))
+          .font(.caption)
+          .foregroundColor(.secondary)
+        Slider(value: Binding(
+          get: { Double(currentStrokeWidth) },
+          set: { currentStrokeWidth = CGFloat($0) }
+        ), in: 1...18, step: 1)
+        .accessibilityLabel(localized("editor.stroke"))
+        .accessibilityValue("\(Int(currentStrokeWidth)) pt")
+      }
+
+      TextField(localized("editor.text_placeholder"), text: $textInput)
+        .textFieldStyle(.roundedBorder)
+
+      Button {
+        onClearCrop()
+      } label: {
+        Label(localized("editor.clear_crop"), systemImage: "crop")
+      }
+      .disabled(!hasCrop)
+
+      Spacer()
+    }
+    .padding(14)
+    .background(Color.primary.opacity(0.04))
+  }
+}
+
+private struct SessionStrip: View {
+  enum Action {
+    case edit
+    case review
+  }
+
+  let activeID: UUID
+  @ObservedObject var store: WorkspaceStore
+  var action: Action = .edit
+  @ObservedObject private var queue = ShotQueueStore.shared
+
+  var body: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 10) {
+        ForEach(queue.items) { item in
+          ShotQueueThumbnail(item: item, isActive: item.id == activeID) {
+            switch action {
+            case .edit:
+              store.openEditor(itemID: item.id)
+            case .review:
+              store.showCaptureReview(itemID: item.id)
+            }
+          }
+        }
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 10)
+    }
+  }
+}
+
+private struct ShotQueueThumbnail: View {
+  let item: ShotQueueItem
+  let isActive: Bool
+  let onSelect: () -> Void
+
+  @State private var thumbnail: NSImage?
+
+  var body: some View {
+    Button(action: onSelect) {
+      ImagePreview(image: thumbnail, cornerRadius: 6)
+        .frame(width: 112, height: 68)
+        .overlay(
+          RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .stroke(isActive ? Color.accentColor : Color.secondary.opacity(0.22), lineWidth: isActive ? 2 : 1)
+        )
+    }
+    .buttonStyle(.plain)
+    .onAppear(perform: loadThumbnail)
+  }
+
+  private func loadThumbnail() {
+    guard thumbnail == nil else { return }
+    DispatchQueue.global(qos: .utility).async {
+      let image = makeThumbnailImage(path: item.path, maxPixelSize: 260)
+      DispatchQueue.main.async {
+        thumbnail = image
+      }
+    }
+  }
+}
+
+private struct WorkspaceInspector: View {
+  @ObservedObject var store: WorkspaceStore
+  @ObservedObject private var queue = ShotQueueStore.shared
+  @ObservedObject private var galleryIndex = GalleryIndexStore.shared
+  @State private var tagsText = ""
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      Text(localized("workspace.inspector"))
+        .font(.body.weight(.semibold))
+
+      if store.selectedSection == .currentSession {
+        sessionInspector
+      } else if store.selectedSection == .missing, let shot = store.selectedMissingShot {
+        missingInspector(shot)
+      } else if let shot = store.selectedShot {
+        libraryInspector(shot)
+      } else {
+        Text(localized("workspace.no_selection"))
+          .font(.caption)
+          .foregroundColor(.secondary)
+      }
+      Spacer()
+    }
+    .padding(14)
+    .onAppear(perform: refreshTagsText)
+    .onChange(of: store.selectedLibraryPath) {
+      refreshTagsText()
+    }
+  }
+
+  private var sessionInspector: some View {
+    VStack(alignment: .leading, spacing: 9) {
+      Label("\(queue.items.count)", systemImage: "tray.full")
+        .font(.caption)
+      if let activeID = queue.activeID, let item = queue.item(for: activeID) {
+        Text(item.path)
+          .font(.caption2)
+          .foregroundColor(.secondary)
+          .lineLimit(4)
+          .truncationMode(.middle)
+      }
+    }
+  }
+
+  private func libraryInspector(_ shot: LibraryShot) -> some View {
+    let entry = galleryIndex.entry(for: shot.path)
+    return VStack(alignment: .leading, spacing: 11) {
+      Text(shot.url.lastPathComponent)
+        .font(.caption.weight(.medium))
+        .lineLimit(2)
+      Text(shot.path)
+        .font(.caption2)
+        .foregroundColor(.secondary)
+        .lineLimit(4)
+        .truncationMode(.middle)
+      HStack {
+        Button(localized("common.edit")) {
+          store.openEditor(forPath: shot.path)
+        }
+        Button(localized("common.show_in_finder")) {
+          NSWorkspace.shared.activateFileViewerSelecting([shot.url])
+        }
+      }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
+      Toggle(isOn: Binding(
+        get: { entry.favorite },
+        set: { _ in store.toggleFavorite(path: shot.path) }
+      )) {
+        Text(localized("common.favorite"))
+      }
+      .toggleStyle(.checkbox)
+
+      Divider()
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text(localized("inspector.tags"))
+          .font(.body.weight(.medium))
+        HStack {
+          TextField(localized("inspector.tags_hint"), text: $tagsText)
+            .textFieldStyle(.roundedBorder)
+            .onSubmit { store.updateTags(path: shot.path, text: tagsText) }
+          Button(localized("common.save")) {
+            store.updateTags(path: shot.path, text: tagsText)
+          }
+        }
+      }
+
+      Divider()
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text(localized("inspector.ocr"))
+          .font(.caption.weight(.semibold))
+        ocrStatus(for: shot.path, entry: entry)
+      }
+    }
+  }
+
+  private func missingInspector(_ shot: GalleryIndexEntry) -> some View {
+    VStack(alignment: .leading, spacing: 9) {
+      Label(shot.fileName, systemImage: "photo.badge.exclamationmark")
+        .font(.headline)
+        .foregroundStyle(.orange)
+      Text(shot.path)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .textSelection(.enabled)
+      if !shot.tags.isEmpty {
+        Text(shot.tags.joined(separator: ", "))
+          .font(.caption)
+      }
+    }
+  }
+
+  private func refreshTagsText() {
+    guard let path = store.selectedLibraryPath,
+          store.selectedSection != .missing else {
+      tagsText = ""
+      return
+    }
+    tagsText = galleryIndex.entry(for: path).tags.joined(separator: ", ")
+  }
+
+  @ViewBuilder
+  private func ocrStatus(for path: String, entry: GalleryIndexEntry) -> some View {
+    if !SettingsStore.shared.galleryOCREnabled {
+      Text(localized("status.ocr_disabled"))
+        .font(.caption2)
+        .foregroundColor(.secondary)
+    } else if store.isOCRRunning(for: path) || entry.ocrIndexedAt == nil {
+      Label(localized("status.indexing"), systemImage: "text.viewfinder")
+        .font(.caption2)
+        .foregroundColor(.secondary)
+    } else if entry.ocrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      Text(localized("status.no_text"))
+        .font(.caption2)
+        .foregroundColor(.secondary)
+    } else {
+      Text(entry.ocrText)
+        .font(.caption2)
+        .foregroundColor(.secondary)
+        .lineLimit(8)
+        .textSelection(.enabled)
+    }
+  }
+}
+
+private struct PermissionRequiredView: View {
+  var body: some View {
+    ContentUnavailableView {
+      Label(localized("permission.title"), systemImage: "lock.shield")
+    } description: {
+      Text(localized("permission.message"))
+    } actions: {
+      Button {
+        AppDelegate.shared.openScreenRecordingSettings()
+      } label: {
+        Label(localized("permission.open_settings"), systemImage: "gearshape")
+      }
+      .buttonStyle(.borderedProminent)
+      .accessibilityIdentifier("permission.openSettings")
+    }
+  }
+}
+
+private struct ErrorStateView: View {
+  let message: String
+
+  var body: some View {
+    ContentUnavailableView {
+      Label(localized("status.capture_failed"), systemImage: "exclamationmark.triangle")
+    } description: {
+      Text(message)
+    } actions: {
+      Button {
+        AppDelegate.shared.triggerCaptureFlow()
+      } label: {
+        Label(localized("common.retry"), systemImage: "arrow.clockwise")
+      }
+      .buttonStyle(.borderedProminent)
+      .accessibilityIdentifier("error.retry")
+    }
+  }
+}
+
+private struct ImagePreview: View {
+  let image: NSImage?
+  let cornerRadius: CGFloat
+
+  var body: some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        .fill(Color.black.opacity(0.78))
+      if let image {
         Image(nsImage: image)
           .resizable()
-          .frame(width: imageRect.width, height: imageRect.height)
-          .position(x: imageRect.midX, y: imageRect.midY)
-        
-        Canvas { context, _ in
-          var drawingContext = context
-          drawingContext.clip(to: Path(imageRect))
-          drawingContext.translateBy(x: imageRect.minX, y: imageRect.minY)
-          drawingContext.scaleBy(x: imageScale, y: imageScale)
-          
-          for annotation in annotations {
-            var path = Path()
-            switch annotation.type {
-            case .freehand:
-              if annotation.points.count > 1 {
-                path.addLines(annotation.points)
-                drawingContext.stroke(path, with: .color(annotation.color), lineWidth: annotation.strokeWidth)
-              }
-            case .rectangle:
-              path.addRect(annotation.rect)
-              drawingContext.stroke(path, with: .color(annotation.color), lineWidth: annotation.strokeWidth)
-            case .arrow:
-              if annotation.points.count == 2 {
-                drawArrow(in: &drawingContext, from: annotation.points[0], to: annotation.points[1], color: annotation.color, width: annotation.strokeWidth)
-              }
-            default:
-              break
-            }
-          }
-          
-          if let dragStart = dragStart, let dragCurrent = dragCurrent {
-            var path = Path()
-            switch currentTool {
-            case .freehand:
-              if currentPoints.count > 1 {
-                path.addLines(currentPoints)
-                drawingContext.stroke(path, with: .color(currentColor), lineWidth: currentStrokeWidth)
-              }
-            case .rectangle:
-              let rect = CGRect(from: dragStart, to: dragCurrent)
-              path.addRect(rect)
-              drawingContext.stroke(path, with: .color(currentColor), lineWidth: currentStrokeWidth)
-            case .arrow:
-              drawArrow(in: &drawingContext, from: dragStart, to: dragCurrent, color: currentColor, width: currentStrokeWidth)
-            case .select:
-              let rect = CGRect(from: dragStart, to: dragCurrent)
-              path.addRect(rect)
-              drawingContext.stroke(path, with: .color(.blue), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-            default:
-              break
-            }
-          }
-        }
-        
-        ForEach(annotations) { annotation in
-          if annotation.type == .text, let firstPoint = annotation.points.first {
-            Text(annotation.text)
-              .font(.system(size: (annotation.strokeWidth * 3 + 12) * imageScale))
-              .foregroundColor(annotation.color)
-              .position(
-                viewPoint(
-                  for: firstPoint,
-                  imageRect: imageRect,
-                  imageSize: image.size
-                )
-              )
-              .allowsHitTesting(false)
-          }
-        }
-      }
-      .gesture(
-        DragGesture(minimumDistance: 0)
-          .onChanged { value in
-            if dragStart == nil {
-              guard imageRect.contains(value.startLocation) else { return }
-              let start = imagePoint(
-                for: value.startLocation,
-                imageRect: imageRect,
-                imageSize: image.size
-              )
-              dragStart = start
-              currentPoints = [start]
-            }
-            let point = imagePoint(
-              for: value.location,
-              imageRect: imageRect,
-              imageSize: image.size
-            )
-            dragCurrent = point
-            if currentTool == .freehand {
-              currentPoints.append(point)
-            }
-          }
-          .onEnded { value in
-            guard let start = dragStart else { return }
-            let end = imagePoint(
-              for: value.location,
-              imageRect: imageRect,
-              imageSize: image.size
-            )
-            
-            switch currentTool {
-            case .freehand:
-              if currentPoints.count > 1 {
-                annotations.append(Annotation(type: .freehand, color: currentColor, strokeWidth: currentStrokeWidth, points: currentPoints))
-                onAction()
-              }
-            case .rectangle:
-              let rect = CGRect(from: start, to: end)
-              annotations.append(Annotation(type: .rectangle, color: currentColor, strokeWidth: currentStrokeWidth, rect: rect))
-              onAction()
-            case .arrow:
-              annotations.append(Annotation(type: .arrow, color: currentColor, strokeWidth: currentStrokeWidth, points: [start, end]))
-              onAction()
-            case .text:
-              if !textInput.isEmpty {
-                annotations.append(Annotation(type: .text, color: currentColor, strokeWidth: currentStrokeWidth, points: [start], text: textInput))
-                onAction()
-              }
-            case .select:
-              cropRect = CGRect(from: start, to: end)
-              onAction()
-            }
-            
-            dragStart = nil
-            dragCurrent = nil
-            currentPoints = []
-          }
-      )
-    }
-  }
-  
-  private func drawArrow(in context: inout GraphicsContext, from: CGPoint, to: CGPoint, color: Color, width: CGFloat) {
-    var path = Path()
-    path.move(to: from)
-    path.addLine(to: to)
-    context.stroke(path, with: .color(color), lineWidth: width)
-    
-    let angle = atan2(to.y - from.y, to.x - from.x)
-    let arrowLength: CGFloat = width * 2 + 10
-    
-    let p1 = CGPoint(x: to.x - arrowLength * cos(angle - .pi/6), y: to.y - arrowLength * sin(angle - .pi/6))
-    let p2 = CGPoint(x: to.x - arrowLength * cos(angle + .pi/6), y: to.y - arrowLength * sin(angle + .pi/6))
-    
-    var arrowHead = Path()
-    arrowHead.move(to: to)
-    arrowHead.addLine(to: p1)
-    arrowHead.addLine(to: p2)
-    arrowHead.closeSubpath()
-    
-    context.fill(arrowHead, with: .color(color))
-  }
-}
-
-private func fittedImageRect(imageSize: CGSize, in availableSize: CGSize) -> CGRect {
-  guard imageSize.width > 0,
-        imageSize.height > 0,
-        availableSize.width > 0,
-        availableSize.height > 0 else {
-    return .zero
-  }
-  
-  let scale = min(
-    availableSize.width / imageSize.width,
-    availableSize.height / imageSize.height
-  )
-  let fittedSize = CGSize(
-    width: imageSize.width * scale,
-    height: imageSize.height * scale
-  )
-  return CGRect(
-    x: (availableSize.width - fittedSize.width) / 2,
-    y: (availableSize.height - fittedSize.height) / 2,
-    width: fittedSize.width,
-    height: fittedSize.height
-  )
-}
-
-private func imagePoint(
-  for viewPoint: CGPoint,
-  imageRect: CGRect,
-  imageSize: CGSize
-) -> CGPoint {
-  guard imageRect.width > 0, imageRect.height > 0 else {
-    return .zero
-  }
-  
-  let x = ((viewPoint.x - imageRect.minX) / imageRect.width) * imageSize.width
-  let y = ((viewPoint.y - imageRect.minY) / imageRect.height) * imageSize.height
-  return CGPoint(
-    x: min(max(x, 0), imageSize.width),
-    y: min(max(y, 0), imageSize.height)
-  )
-}
-
-private func viewPoint(
-  for imagePoint: CGPoint,
-  imageRect: CGRect,
-  imageSize: CGSize
-) -> CGPoint {
-  guard imageSize.width > 0, imageSize.height > 0 else {
-    return imageRect.origin
-  }
-  
-  return CGPoint(
-    x: imageRect.minX + (imagePoint.x / imageSize.width) * imageRect.width,
-    y: imageRect.minY + (imagePoint.y / imageSize.height) * imageRect.height
-  )
-}
-
-// MARK: - CGRect Helpers
-extension CGRect {
-  init(from: CGPoint, to: CGPoint) {
-    let x = min(from.x, to.x)
-    let y = min(from.y, to.y)
-    let width = abs(from.x - to.x)
-    let height = abs(from.y - to.y)
-    self.init(x: x, y: y, width: width, height: height)
-  }
-}
-
-struct WatermarkRenderSettings {
-  let textEnabled: Bool
-  let text: String
-  var textColor: String = "#FFFFFF"
-  let logoEnabled: Bool
-  let logoPath: String
-  let opacity: Double
-  let logoSize: Double
-  let position: String
-  let layoutMode: String
-  let spacing: Double
-  let tilePattern: String
-  let tileRandomness: Double
-  
-  static func current(store: SettingsStore = SettingsStore.shared) -> WatermarkRenderSettings {
-    WatermarkRenderSettings(
-      textEnabled: store.watermarkTextEnabled,
-      text: store.watermarkText,
-      textColor: store.watermarkTextColor,
-      logoEnabled: store.watermarkLogoEnabled,
-      logoPath: store.watermarkLogoPath,
-      opacity: store.watermarkOpacity,
-      logoSize: store.watermarkSize,
-      position: store.watermarkPosition,
-      layoutMode: store.watermarkLayoutMode,
-      spacing: store.watermarkSpacing,
-      tilePattern: store.watermarkTilePattern,
-      tileRandomness: store.watermarkTileRandomness
-    )
-  }
-}
-
-private func deterministicTileJitter(row: Int, column: Int, salt: Int) -> CGFloat {
-  let seed = Double(row * 12_989 + column * 78_233 + salt * 37_719)
-  let raw = sin(seed) * 43_758.5453
-  let fraction = raw - floor(raw)
-  return CGFloat(fraction * 2 - 1)
-}
-
-// MARK: - CoreGraphics Rendering & Save Actions
-func renderAnnotatedImage(
-  image: NSImage,
-  annotations: [Annotation],
-  cropRect: CGRect?,
-  watermark: WatermarkRenderSettings = .current()
-) -> NSImage? {
-  let imageWidth = image.size.width
-  let imageHeight = image.size.height
-  let imageBounds = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
-  let exportRect = normalizedCropRect(cropRect, in: imageBounds)
-  let watermarkTarget = CGRect(
-    x: exportRect.minX,
-    y: imageHeight - exportRect.maxY,
-    width: exportRect.width,
-    height: exportRect.height
-  )
-  
-  guard let rep = NSBitmapImageRep(
-    bitmapDataPlanes: nil,
-    pixelsWide: Int(imageWidth),
-    pixelsHigh: Int(imageHeight),
-    bitsPerSample: 8,
-    samplesPerPixel: 4,
-    hasAlpha: true,
-    isPlanar: false,
-    colorSpaceName: .deviceRGB,
-    bytesPerRow: 0,
-    bitsPerPixel: 0
-  ) else { return nil }
-  
-  rep.size = image.size
-  
-  NSGraphicsContext.saveGraphicsState()
-  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-  defer {
-    NSGraphicsContext.restoreGraphicsState()
-  }
-  
-  image.draw(in: NSRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
-
-  let context = NSGraphicsContext.current?.cgContext
-  
-  for annotation in annotations {
-    context?.saveGState()
-    
-    let cgColor = NSColor(annotation.color).cgColor
-    context?.setStrokeColor(cgColor)
-    context?.setFillColor(cgColor)
-    context?.setLineWidth(annotation.strokeWidth)
-    context?.setLineCap(.round)
-    context?.setLineJoin(.round)
-    
-    switch annotation.type {
-    case .freehand:
-      if annotation.points.count > 1 {
-        context?.beginPath()
-        let first = annotation.points[0]
-        context?.move(to: CGPoint(x: first.x, y: imageHeight - first.y))
-        for i in 1..<annotation.points.count {
-          let pt = annotation.points[i]
-          context?.addLine(to: CGPoint(x: pt.x, y: imageHeight - pt.y))
-        }
-        context?.strokePath()
-      }
-    case .rectangle:
-      let sourceRect = annotation.rect.standardized
-      let flippedY = imageHeight - (sourceRect.origin.y + sourceRect.size.height)
-      let renderRect = CGRect(
-        x: sourceRect.origin.x,
-        y: flippedY,
-        width: sourceRect.size.width,
-        height: sourceRect.size.height
-      )
-      context?.stroke(renderRect)
-    case .arrow:
-      if annotation.points.count == 2 {
-        let from = CGPoint(
-          x: annotation.points[0].x,
-          y: imageHeight - annotation.points[0].y
-        )
-        let to = CGPoint(
-          x: annotation.points[1].x,
-          y: imageHeight - annotation.points[1].y
-        )
-        
-        context?.beginPath()
-        context?.move(to: from)
-        context?.addLine(to: to)
-        context?.strokePath()
-        
-        let angle = atan2(to.y - from.y, to.x - from.x)
-        let arrowLength = annotation.strokeWidth * 2 + 10
-        
-        let p1 = CGPoint(x: to.x - arrowLength * cos(angle - .pi/6), y: to.y - arrowLength * sin(angle - .pi/6))
-        let p2 = CGPoint(x: to.x - arrowLength * cos(angle + .pi/6), y: to.y - arrowLength * sin(angle + .pi/6))
-        
-        context?.beginPath()
-        context?.move(to: to)
-        context?.addLine(to: p1)
-        context?.addLine(to: p2)
-        context?.closePath()
-        context?.fillPath()
-      }
-    case .text:
-      if let first = annotation.points.first {
-        let fontSize = annotation.strokeWidth * 3 + 12
-        let textFont = NSFont.systemFont(ofSize: fontSize)
-        let attributes: [NSAttributedString.Key: Any] = [
-          .font: textFont,
-          .foregroundColor: NSColor(annotation.color)
-        ]
-        let textStr = annotation.text as NSString
-        let textRect = NSRect(
-          x: first.x,
-          y: imageHeight - first.y - fontSize,
-          width: imageWidth,
-          height: imageHeight
-        )
-        textStr.draw(in: textRect, withAttributes: attributes)
-      }
-    default:
-      break
-    }
-    
-    context?.restoreGState()
-  }
-  
-  // Render watermark
-  let opacity = CGFloat(watermark.opacity)
-  
-  if watermark.layoutMode == "tiled" {
-    context?.saveGState()
-    context?.clip(to: watermarkTarget)
-    context?.translateBy(x: watermarkTarget.midX, y: watermarkTarget.midY)
-    
-    let angle = -CGFloat.pi / 6
-    context?.rotate(by: angle)
-    
-    let diagonal = sqrt(
-      watermarkTarget.width * watermarkTarget.width +
-        watermarkTarget.height * watermarkTarget.height
-    )
-    
-    var loadedLogo: NSImage? = nil
-    var logoW: CGFloat = 0
-    var logoH: CGFloat = 0
-    if watermark.logoEnabled && !watermark.logoPath.isEmpty {
-      if let logoImg = NSImage(contentsOfFile: watermark.logoPath) {
-        loadedLogo = logoImg
-        logoW = CGFloat(watermark.logoSize)
-        logoH = logoImg.size.height * (logoW / logoImg.size.width)
+          .interpolation(.high)
+          .aspectRatio(contentMode: .fit)
+          .padding(8)
+      } else {
+        ProgressView()
       }
     }
-    
-    var textFont: NSFont? = nil
-    var textAttributes: [NSAttributedString.Key: Any] = [:]
-    var textSize = CGSize.zero
-    let hasText = watermark.textEnabled && !watermark.text.isEmpty
-    let waterText = watermark.text as NSString
-    
-    if hasText {
-      let fontSize = 20.0
-      textFont = NSFont.boldSystemFont(ofSize: fontSize)
-      textAttributes = [
-        .font: textFont!,
-        .foregroundColor: NSColor(hexString: watermark.textColor).withAlphaComponent(opacity)
-      ]
-      textSize = waterText.size(withAttributes: textAttributes)
-    }
-    
-    let spacingX = CGFloat(watermark.spacing) * 1.5
-    let spacingY = CGFloat(watermark.spacing) * 1.1
-    
-    var rowIndex = 0
-    for y in stride(from: -diagonal, to: diagonal, by: spacingY) {
-      let rowOffset = watermark.tilePattern == "brick" || watermark.tilePattern == "random"
-        ? (rowIndex.isMultiple(of: 2) ? 0 : spacingX / 2)
-        : 0
-      var columnIndex = 0
-      for x in stride(from: -diagonal, to: diagonal, by: spacingX) {
-        let jitterLimit = watermark.tilePattern == "random"
-          ? min(spacingX, spacingY) * CGFloat(watermark.tileRandomness) * 0.35
-          : 0
-        let drawX = x + rowOffset + deterministicTileJitter(row: rowIndex, column: columnIndex, salt: 1) * jitterLimit
-        let drawY = y + deterministicTileJitter(row: rowIndex, column: columnIndex, salt: 2) * jitterLimit
-        
-        if let logoImg = loadedLogo {
-          let logoRect = NSRect(
-            x: drawX - logoW / 2,
-            y: drawY - logoH / 2,
-            width: logoW,
-            height: logoH
-          )
-          logoImg.draw(in: logoRect, from: .zero, operation: .sourceOver, fraction: opacity)
-        }
-        
-        if hasText {
-          let textY: CGFloat
-          if loadedLogo != nil {
-            textY = drawY - logoH / 2 - textSize.height - 6.0
-          } else {
-            textY = drawY - textSize.height / 2
-          }
-          let textRect = NSRect(
-            x: drawX - textSize.width / 2,
-            y: textY,
-            width: textSize.width,
-            height: textSize.height
-          )
-          waterText.draw(in: textRect, withAttributes: textAttributes)
-        }
-        columnIndex += 1
+    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+  }
+}
+
+#if DEBUG
+private struct WorkspaceSurfacePreview<Content: View>: View {
+  let language: AppLanguage
+  let content: Content
+  @ObservedObject private var localization = LocalizationController.shared
+
+  init(language: AppLanguage, @ViewBuilder content: () -> Content) {
+    self.language = language
+    self.content = content()
+  }
+
+  var body: some View {
+    content
+      .environment(\.locale, language.locale)
+      .environment(\.layoutDirection, language.layoutDirection)
+      .onAppear {
+        SettingsStore.shared.appLanguageCode = language.rawValue
+        localization.refreshFromSettings()
       }
-      rowIndex += 1
-    }
-    
-    context?.restoreGState()
-  } else {
-    var logoHeightUsed: CGFloat = 0
-    
-    if watermark.logoEnabled, !watermark.logoPath.isEmpty,
-       let logoImg = NSImage(contentsOfFile: watermark.logoPath) {
-      let logoWidth = CGFloat(watermark.logoSize)
-      let logoHeight = logoImg.size.height * (logoWidth / logoImg.size.width)
-      logoHeightUsed = logoHeight
-      
-      let padding: CGFloat = min(
-        16.0,
-        min(watermarkTarget.width, watermarkTarget.height) * 0.12
-      )
-      var rect = NSRect.zero
-      
-      switch watermark.position {
-      case "bottomRight":
-        rect = NSRect(
-          x: watermarkTarget.maxX - logoWidth - padding,
-          y: watermarkTarget.minY + padding,
-          width: logoWidth,
-          height: logoHeight
-        )
-      case "bottomLeft":
-        rect = NSRect(
-          x: watermarkTarget.minX + padding,
-          y: watermarkTarget.minY + padding,
-          width: logoWidth,
-          height: logoHeight
-        )
-      case "topRight":
-        rect = NSRect(
-          x: watermarkTarget.maxX - logoWidth - padding,
-          y: watermarkTarget.maxY - logoHeight - padding,
-          width: logoWidth,
-          height: logoHeight
-        )
-      case "topLeft":
-        rect = NSRect(
-          x: watermarkTarget.minX + padding,
-          y: watermarkTarget.maxY - logoHeight - padding,
-          width: logoWidth,
-          height: logoHeight
-        )
-      case "center":
-        rect = NSRect(
-          x: watermarkTarget.midX - logoWidth / 2,
-          y: watermarkTarget.midY - logoHeight / 2,
-          width: logoWidth,
-          height: logoHeight
-        )
-      default:
-        break
+  }
+}
+
+private func previewQueueItemID() -> UUID {
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent("qpark-shot-preview.png")
+  if !FileManager.default.fileExists(atPath: url.path),
+     let image = NSImage(named: NSImage.applicationIconName),
+     let data = ExportService.shared.pngData(from: image) {
+    try? data.write(to: url, options: .atomic)
+  }
+  return ShotQueueStore.shared.enqueue(path: url.path).id
+}
+
+private struct WorkspaceSurfacePreviews: PreviewProvider {
+  static var previews: some View {
+    Group {
+      WorkspaceSurfacePreview(language: .russian) {
+        WorkspaceRootView(store: .shared).frame(width: 920, height: 620)
       }
-      logoImg.draw(in: rect, from: .zero, operation: .sourceOver, fraction: CGFloat(watermark.opacity))
-    }
-    
-    if watermark.textEnabled, !watermark.text.isEmpty {
-      let waterText = watermark.text as NSString
-      let fontSize = 24.0
-      let font = NSFont.boldSystemFont(ofSize: fontSize)
-      let attributes: [NSAttributedString.Key: Any] = [
-        .font: font,
-        .foregroundColor: NSColor(hexString: watermark.textColor).withAlphaComponent(CGFloat(watermark.opacity))
-      ]
-      let size = waterText.size(withAttributes: attributes)
-      let padding: CGFloat = min(
-        16.0,
-        min(watermarkTarget.width, watermarkTarget.height) * 0.12
-      )
-      var rect = NSRect.zero
-      
-      let yOffset = logoHeightUsed > 0 ? (logoHeightUsed + 8.0) : 0
-      
-      switch watermark.position {
-      case "bottomRight":
-        rect = NSRect(
-          x: watermarkTarget.maxX - size.width - padding,
-          y: watermarkTarget.minY + padding + yOffset,
-          width: size.width,
-          height: size.height
-        )
-      case "bottomLeft":
-        rect = NSRect(
-          x: watermarkTarget.minX + padding,
-          y: watermarkTarget.minY + padding + yOffset,
-          width: size.width,
-          height: size.height
-        )
-      case "topRight":
-        rect = NSRect(
-          x: watermarkTarget.maxX - size.width - padding,
-          y: watermarkTarget.maxY - size.height - padding - yOffset,
-          width: size.width,
-          height: size.height
-        )
-      case "topLeft":
-        rect = NSRect(
-          x: watermarkTarget.minX + padding,
-          y: watermarkTarget.maxY - size.height - padding - yOffset,
-          width: size.width,
-          height: size.height
-        )
-      case "center":
-        rect = NSRect(
-          x: watermarkTarget.midX - size.width / 2,
-          y: watermarkTarget.midY - size.height / 2 - yOffset,
-          width: size.width,
-          height: size.height
-        )
-      default:
-        break
+      .preferredColorScheme(.light)
+      .previewDisplayName("Library · RU · Light · 920×620")
+
+      WorkspaceSurfacePreview(language: .arabic) {
+        WorkspaceRootView(store: .shared).frame(width: 1280, height: 800)
       }
-      waterText.draw(in: rect, withAttributes: attributes)
+      .preferredColorScheme(.dark)
+      .previewDisplayName("Library · Arabic RTL · Dark · 1280×800")
+
+      WorkspaceSurfacePreview(language: .german) {
+        CaptureReviewView(itemID: previewQueueItemID(), store: .shared).frame(width: 920, height: 620)
+      }
+      .preferredColorScheme(.light)
+      .previewDisplayName("Review · DE · Light")
+
+      WorkspaceSurfacePreview(language: .russian) {
+        CaptureReviewView(itemID: previewQueueItemID(), store: .shared).frame(width: 1280, height: 800)
+      }
+      .preferredColorScheme(.dark)
+      .previewDisplayName("Review · RU · Dark")
+
+      EditorWorkspaceView(itemID: previewQueueItemID(), store: .shared)
+        .frame(width: 1280, height: 800)
+        .preferredColorScheme(.light)
+        .previewDisplayName("Editor · Light · 1280×800")
+
+      WorkspaceSurfacePreview(language: .arabic) {
+        EditorWorkspaceView(itemID: previewQueueItemID(), store: .shared).frame(width: 920, height: 620)
+      }
+      .preferredColorScheme(.dark)
+      .previewDisplayName("Editor · Arabic RTL · Dark · 920×620")
+
+      WorkspaceSurfacePreview(language: .german) {
+        PermissionRequiredView().frame(width: 920, height: 620)
+      }
+      .preferredColorScheme(.light)
+      .previewDisplayName("Permission · DE · Light")
+
+      WorkspaceSurfacePreview(language: .russian) {
+        ErrorStateView(message: localized("status.capture_failed")).frame(width: 1280, height: 800)
+      }
+      .preferredColorScheme(.dark)
+      .previewDisplayName("Error · RU · Dark")
     }
   }
-
-  let finalImage = NSImage(size: image.size)
-  finalImage.addRepresentation(rep)
-  
-  if exportRect != imageBounds {
-    let targetRect = CGRect(
-      x: exportRect.origin.x,
-      y: exportRect.origin.y,
-      width: exportRect.width,
-      height: exportRect.height
-    )
-    guard let cgImg = rep.cgImage(forProposedRect: nil, context: nil, hints: nil),
-          let croppedCg = cgImg.cropping(to: targetRect) else {
-      return finalImage
-    }
-    return NSImage(cgImage: croppedCg, size: exportRect.size)
-  }
-  
-  return finalImage
 }
-
-private func normalizedCropRect(_ cropRect: CGRect?, in imageBounds: CGRect) -> CGRect {
-  guard let cropRect else {
-    return imageBounds
-  }
-  
-  let crop = cropRect.standardized.intersection(imageBounds)
-  if crop.isNull || crop.width < 2 || crop.height < 2 {
-    return imageBounds
-  }
-  return crop
-}
-
-func saveImage(image: NSImage, isTemporary: Bool) -> String? {
-  guard let tiff = image.tiffRepresentation,
-        let rep = NSBitmapImageRep(data: tiff),
-        let pngData = rep.representation(using: .png, properties: [:]) else {
-    return nil
-  }
-  
-  let fileManager = FileManager.default
-  let folderURL: URL
-  
-  if isTemporary {
-    folderURL = fileManager.temporaryDirectory.appendingPathComponent("QPARK Shot")
-  } else {
-    let store = SettingsStore.shared
-    if !store.saveDirectory.isEmpty {
-      folderURL = URL(fileURLWithPath: store.saveDirectory)
-    } else {
-      let pictures = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first!
-      folderURL = pictures.appendingPathComponent("QPARK Shot")
-    }
-  }
-  
-  try? fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true)
-  
-  let formatter = DateFormatter()
-  formatter.dateFormat = "yyyyMMdd_HHmmss"
-  let filename = "Screenshot_" + formatter.string(from: Date()) + ".png"
-  let fileURL = folderURL.appendingPathComponent(filename)
-  
-  do {
-    try pngData.write(to: fileURL, options: .atomic)
-    return fileURL.path
-  } catch {
-    return nil
-  }
-}
-
-// MARK: - SwiftUI Bridge for NSVisualEffectView
-struct VisualEffectView: NSViewRepresentable {
-  let material: NSVisualEffectView.Material
-  let blendingMode: NSVisualEffectView.BlendingMode
-  
-  func makeNSView(context: Context) -> NSVisualEffectView {
-    let view = NSVisualEffectView()
-    view.material = material
-    view.blendingMode = blendingMode
-    view.state = .active
-    return view
-  }
-  
-  func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-    nsView.material = material
-    nsView.blendingMode = blendingMode
-  }
-}
-
-// MARK: - Color <-> Hex helpers
-
-private func parseHexRGB(_ hexString: String) -> (r: CGFloat, g: CGFloat, b: CGFloat) {
-  let hex = hexString.trimmingCharacters(in: CharacterSet(charactersIn: "#")).uppercased()
-  guard hex.count == 6, let value = UInt32(hex, radix: 16) else {
-    return (1, 1, 1)
-  }
-  let r = CGFloat((value >> 16) & 0xFF) / 255.0
-  let g = CGFloat((value >> 8) & 0xFF) / 255.0
-  let b = CGFloat(value & 0xFF) / 255.0
-  return (r, g, b)
-}
-
-extension NSColor {
-  convenience init(hexString: String) {
-    let rgb = parseHexRGB(hexString)
-    self.init(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1.0)
-  }
-}
-
-extension Color {
-  init(hexString: String) {
-    let rgb = parseHexRGB(hexString)
-    self.init(.sRGB, red: Double(rgb.r), green: Double(rgb.g), blue: Double(rgb.b), opacity: 1.0)
-  }
-}
-
-func hexString(from color: Color) -> String {
-  let ns = NSColor(color).usingColorSpace(.sRGB) ?? NSColor.white
-  let r = Int(round(ns.redComponent * 255))
-  let g = Int(round(ns.greenComponent * 255))
-  let b = Int(round(ns.blueComponent * 255))
-  return String(format: "#%02X%02X%02X", r, g, b)
-}
+#endif

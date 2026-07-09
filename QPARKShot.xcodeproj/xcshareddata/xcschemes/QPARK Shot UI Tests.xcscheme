@@ -9,9 +9,9 @@
          <BuildActionEntry
             buildForTesting = "YES"
             buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "TG00000000000000000001"
@@ -33,13 +33,22 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "TG00000000000000000002"
-               BuildableName = "QPARK Shot Tests.xctest"
-               BlueprintName = "QPARK Shot Tests"
+               BlueprintIdentifier = "TG00000000000000000003"
+               BuildableName = "QPARK Shot UI Tests.xctest"
+               BlueprintName = "QPARK Shot UI Tests"
                ReferencedContainer = "container:QPARKShot.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
+      <MacroExpansion>
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "TG00000000000000000001"
+            BuildableName = "QPARK Shot.app"
+            BlueprintName = "QPARK Shot"
+            ReferencedContainer = "container:QPARKShot.xcodeproj">
+         </BuildableReference>
+      </MacroExpansion>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
@@ -49,10 +58,8 @@
       useCustomWorkingDirectory = "NO"
       ignoresPersistentStateOnLaunch = "NO"
       debugDocumentVersioning = "YES"
-      debugServiceExtension = "internal"
-      allowLocationSimulation = "YES">
-      <BuildableProductRunnable
-         runnableDebuggingMode = "0">
+      debugServiceExtension = "internal">
+      <BuildableProductRunnable runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "TG00000000000000000001"
@@ -62,28 +69,10 @@
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
-   <ProfileAction
-      buildConfiguration = "Release"
-      shouldUseLaunchSchemeArgsEnv = "YES"
-      savedToolIdentifier = ""
-      useCustomWorkingDirectory = "NO"
-      debugDocumentVersioning = "YES">
-      <BuildableProductRunnable
-         runnableDebuggingMode = "0">
-         <BuildableReference
-            BuildableIdentifier = "primary"
-            BlueprintIdentifier = "TG00000000000000000001"
-            BuildableName = "QPARK Shot.app"
-            BlueprintName = "QPARK Shot"
-            ReferencedContainer = "container:QPARKShot.xcodeproj">
-         </BuildableReference>
-      </BuildableProductRunnable>
+   <ProfileAction buildConfiguration = "Release" shouldUseLaunchSchemeArgsEnv = "YES" savedToolIdentifier = "" useCustomWorkingDirectory = "NO" debugDocumentVersioning = "YES">
    </ProfileAction>
-   <AnalyzeAction
-      buildConfiguration = "Debug">
+   <AnalyzeAction buildConfiguration = "Debug">
    </AnalyzeAction>
-   <ArchiveAction
-      buildConfiguration = "Release"
-      revealArchiveInOrganizer = "YES">
+   <ArchiveAction buildConfiguration = "Release" revealArchiveInOrganizer = "NO">
    </ArchiveAction>
 </Scheme>

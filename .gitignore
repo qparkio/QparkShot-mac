@@ -34,9 +34,6 @@ scripts/
 # Local documentation pages and QA notes
 docs/
 
-# Local tests are excluded from the minimal public app build set
-Tests/
-
 # IDE
 .idea/
 .vscode/

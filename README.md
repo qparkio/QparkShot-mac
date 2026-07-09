@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="macOS" src="https://img.shields.io/badge/macOS-12.3%2B-111111">
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-14%2B-111111">
   <img alt="Swift" src="https://img.shields.io/badge/Swift-5-orange">
   <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
@@ -57,7 +57,7 @@ The app is intentionally simple from an infrastructure point of view: no analyti
 
 ## Requirements
 
-- macOS 12.3 or later
+- macOS 14 or later
 - Xcode 15 or later
 - Swift 5
 

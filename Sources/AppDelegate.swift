@@ -3,10 +3,20 @@ import Carbon
 import SwiftUI
 import ScreenCaptureKit
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-  static var shared: AppDelegate { NSApp.delegate as! AppDelegate }
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+  static var current: AppDelegate? {
+    NSApp.delegate as? AppDelegate
+  }
+
+  static var shared: AppDelegate {
+    guard let delegate = NSApp.delegate as? AppDelegate else {
+      preconditionFailure("AppDelegate is not installed")
+    }
+    return delegate
+  }
   
-  private static let hotKeySignature = OSType(0x51504B53) // "QPKS"
+  nonisolated private static let hotKeySignature = OSType(0x51504B53) // "QPKS"
   private static var hasRequestedScreenCapturePermissionInSession = false
   
   private struct RegisteredGlobalShortcut {
@@ -22,6 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private var registeredGlobalShortcuts: [String: RegisteredGlobalShortcut] = [:]
   private var shortcutIDsByCarbonID: [UInt32: String] = [:]
   private var nextHotKeyID: UInt32 = 1
+  private var cleanupSchedulerTask: Task<Void, Never>?
   
   func applicationDidFinishLaunching(_ notification: Notification) {
     writeDebugLog("applicationDidFinishLaunching start")
@@ -33,10 +44,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     
     // Show gallery on launch
     showGallery()
+    startCleanupScheduler()
     writeDebugLog("applicationDidFinishLaunching end")
   }
   
   func applicationWillTerminate(_ notification: Notification) {
+    cleanupSchedulerTask?.cancel()
+    cleanupSchedulerTask = nil
     unregisterAllGlobalShortcuts()
     if let hotkeyEventHandler = hotkeyEventHandler {
       RemoveEventHandler(hotkeyEventHandler)
@@ -54,82 +68,139 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   
   func applyThemePreference() {
     let appearanceName = SettingsStore.shared.appKitAppearanceName
-    let apply = {
-      NSApp.appearance = appearanceName.flatMap { NSAppearance(named: $0) }
-    }
-    
-    if Thread.isMainThread {
-      apply()
-    } else {
-      DispatchQueue.main.async(execute: apply)
-    }
+    NSApp.appearance = appearanceName.flatMap { NSAppearance(named: $0) }
   }
   
   // MARK: - Main Menu (built programmatically; replaces the legacy MainMenu.xib)
   func setupMainMenu() {
     let mainMenu = NSMenu()
 
-    // Application menu
     let appMenuItem = NSMenuItem()
     mainMenu.addItem(appMenuItem)
     let appMenu = NSMenu()
-    appMenu.addItem(withTitle: "About QPARK Shot", action: #selector(showAboutAction), keyEquivalent: "")
+    appMenu.addItem(withTitle: localized("menu.about"), action: #selector(showAboutAction), keyEquivalent: "")
     appMenu.addItem(.separator())
-    let prefs = appMenu.addItem(withTitle: "Preferences…", action: #selector(showPreferencesWindow(_:)), keyEquivalent: ",")
+    let prefs = appMenu.addItem(withTitle: localized("common.preferences"), action: #selector(showPreferencesWindow(_:)), keyEquivalent: ",")
     prefs.keyEquivalentModifierMask = [.command]
     appMenu.addItem(.separator())
-    appMenu.addItem(withTitle: "Hide QPARK Shot", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-    appMenu.addItem(withTitle: "Quit QPARK Shot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appMenu.addItem(withTitle: localized("menu.hide"), action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+    appMenu.addItem(withTitle: localized("common.quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     appMenuItem.submenu = appMenu
 
-    // Edit menu (standard text editing shortcuts: undo/redo/cut/copy/paste/select-all)
     let editMenuItem = NSMenuItem()
     mainMenu.addItem(editMenuItem)
-    let editMenu = NSMenu(title: "Edit")
-    editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-    let redo = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+    let editMenu = NSMenu(title: localized("menu.edit"))
+    editMenu.addItem(withTitle: localized("editor.undo"), action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = editMenu.addItem(withTitle: localized("editor.redo"), action: Selector(("redo:")), keyEquivalent: "z")
     redo.keyEquivalentModifierMask = [.command, .shift]
     editMenu.addItem(.separator())
-    editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-    editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-    editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-    editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editMenu.addItem(withTitle: localized("menu.cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(withTitle: localized("common.copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(withTitle: localized("menu.paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(withTitle: localized("menu.select_all"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
     editMenuItem.submenu = editMenu
 
-    // Window menu
     let windowMenuItem = NSMenuItem()
     mainMenu.addItem(windowMenuItem)
-    let windowMenu = NSMenu(title: "Window")
-    windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-    windowMenu.addItem(withTitle: "Gallery", action: #selector(showGalleryAction), keyEquivalent: "g")
+    let windowMenu = NSMenu(title: localized("menu.window"))
+    windowMenu.addItem(withTitle: localized("menu.minimize"), action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+    windowMenu.addItem(withTitle: localized("workspace.library"), action: #selector(showGalleryAction), keyEquivalent: "g")
     windowMenuItem.submenu = windowMenu
 
     NSApp.mainMenu = mainMenu
     NSApp.windowsMenu = windowMenu
   }
 
+  func rebuildLocalizedSurfaces() {
+    setupMainMenu()
+    setupStatusItem()
+    galleryWindow?.title = localized("app.name")
+    PreferencesWindowController.shared.refreshLocalizedChrome()
+  }
+
+  @MainActor
+  func scheduleCleanupRun() {
+    Task { [weak self] in
+      await self?.performCleanup()
+    }
+  }
+
+  @MainActor
+  private func startCleanupScheduler() {
+    cleanupSchedulerTask?.cancel()
+    scheduleCleanupRun()
+    cleanupSchedulerTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(30 * 60))
+        guard !Task.isCancelled else { return }
+        await self?.performCleanup()
+      }
+    }
+  }
+
+  @MainActor
+  private func performCleanup() async {
+    let settings = SettingsStore.shared
+    let policy = settings.cleanupPolicy
+    guard policy.mode == .afterDuration else { return }
+
+    let workspace = WorkspaceStore.shared
+    let report = await CleanupService.shared.run(
+      policy: policy,
+      galleryEntries: Array(GalleryIndexStore.shared.entries.values),
+      activePaths: workspace.cleanupActivePaths,
+      temporaryRoots: [captureScratchFolderURL(), storageFolderURL(isTemporary: true)],
+      savedRoots: galleryStorageFolderCandidates(
+        saveDirectory: settings.saveDirectory,
+        bookmarkData: settings.saveDirectoryBookmarkData
+      )
+    )
+
+    for path in report.trashedSavedPaths {
+      GalleryIndexStore.shared.forget(path: path)
+    }
+    if report.changedAnything {
+      workspace.presentStatus(
+        localized(report.failures.isEmpty ? "status.cleanup_completed" : "status.cleanup_failed"),
+        kind: report.failures.isEmpty ? .success : .warning
+      )
+      workspace.loadLibrary()
+    } else if !report.failures.isEmpty {
+      workspace.presentStatus(localized("status.cleanup_failed"), kind: .error)
+    }
+  }
+
   // MARK: - Status Bar Icon
   func setupStatusItem() {
-    statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    if statusItem == nil {
+      statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    }
     if let button = statusItem?.button {
-      let image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "QPARK Shot")
+      let image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: localized("app.name"))
       button.image = image
     }
     
     let menu = NSMenu()
     
-    let captureItem = NSMenuItem(title: "Capture Selected Area...", action: #selector(triggerCaptureAction), keyEquivalent: "c")
-    captureItem.keyEquivalentModifierMask = [.command, .shift]
+    let captureItem = NSMenuItem(title: localized("capture.selected_area"), action: #selector(triggerCaptureAction), keyEquivalent: "")
+    applyMenuShortcut(SettingsStore.shared.selectionHotkey, to: captureItem)
     menu.addItem(captureItem)
 
-    let fullScreenItem = NSMenuItem(title: "Capture Full Screen", action: #selector(triggerFullScreenCaptureAction), keyEquivalent: "")
+    let fullScreenItem = NSMenuItem(title: localized("capture.full_screen"), action: #selector(triggerFullScreenCaptureAction), keyEquivalent: "")
+    applyMenuShortcut(SettingsStore.shared.fullScreenHotkey, to: fullScreenItem)
     menu.addItem(fullScreenItem)
 
-    let delayItem = NSMenuItem(title: "Capture with Delay", action: nil, keyEquivalent: "")
+    let windowItem = NSMenuItem(title: localized("capture.window"), action: #selector(triggerWindowCaptureAction), keyEquivalent: "")
+    menu.addItem(windowItem)
+
+    let repeatAreaItem = NSMenuItem(title: localized("capture.repeat_area"), action: #selector(triggerRepeatAreaCaptureAction), keyEquivalent: "")
+    menu.addItem(repeatAreaItem)
+
+    let delayItem = NSMenuItem(title: localized("capture.with_delay"), action: nil, keyEquivalent: "")
     let delayMenu = NSMenu()
     for seconds in [3, 5, 10] {
       let item = NSMenuItem(
-        title: "\(seconds) seconds",
+        title: LocalizationController.shared.format("capture.seconds_format", seconds),
         action: #selector(triggerDelayedCaptureAction(_:)),
         keyEquivalent: ""
       )
@@ -141,43 +212,58 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     menu.addItem(NSMenuItem.separator())
 
-    let galleryItem = NSMenuItem(title: "Open Gallery", action: #selector(showGalleryAction), keyEquivalent: "g")
+    let galleryItem = NSMenuItem(title: localized("workspace.library"), action: #selector(showGalleryAction), keyEquivalent: "g")
     galleryItem.keyEquivalentModifierMask = [.command]
     menu.addItem(galleryItem)
     
-    let preferencesItem = NSMenuItem(title: "Preferences...", action: #selector(showPreferencesWindow(_:)), keyEquivalent: ",")
+    let preferencesItem = NSMenuItem(title: localized("common.preferences"), action: #selector(showPreferencesWindow(_:)), keyEquivalent: ",")
     preferencesItem.keyEquivalentModifierMask = [.command]
     menu.addItem(preferencesItem)
     
     menu.addItem(NSMenuItem.separator())
     
-    let aboutItem = NSMenuItem(title: "About QPARK Shot", action: #selector(showAboutAction), keyEquivalent: "")
+    let aboutItem = NSMenuItem(title: localized("menu.about"), action: #selector(showAboutAction), keyEquivalent: "")
     menu.addItem(aboutItem)
     
-    let quitItem = NSMenuItem(title: "Quit QPARK Shot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    let quitItem = NSMenuItem(title: localized("common.quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     quitItem.keyEquivalentModifierMask = [.command]
     menu.addItem(quitItem)
     
     statusItem?.menu = menu
   }
   
+  @MainActor
   @objc func triggerCaptureAction(_ sender: Any?) {
     triggerCaptureFlow()
   }
 
+  @MainActor
   @objc func triggerFullScreenCaptureAction(_ sender: Any?) {
     triggerCaptureFlow(modeOverride: "fullScreen")
   }
 
+  @MainActor
+  @objc func triggerWindowCaptureAction(_ sender: Any?) {
+    triggerCaptureFlow(modeOverride: "window")
+  }
+
+  @MainActor
+  @objc func triggerRepeatAreaCaptureAction(_ sender: Any?) {
+    triggerCaptureFlow(modeOverride: "repeatLastArea")
+  }
+
+  @MainActor
   @objc func triggerDelayedCaptureAction(_ sender: Any?) {
     let seconds = (sender as? NSMenuItem)?.tag ?? 3
     triggerCaptureFlow(delayOverride: seconds)
   }
   
+  @MainActor
   @objc func showGalleryAction(_ sender: Any?) {
     showGallery()
   }
   
+  @MainActor
   @objc func showPreferencesWindow(_ sender: Any?) {
     showSettings()
   }
@@ -187,26 +273,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
   
   // MARK: - Native Windows
+  @MainActor
   func showGallery() {
     MainWindowNavigation.shared.showGallery()
-    focusMainWindow(preferredContentSize: CGSize(width: 760, height: 520))
+    focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
   }
   
+  @MainActor
   func showSettings() {
-    MainWindowNavigation.shared.showSettings()
-    focusMainWindow(preferredContentSize: CGSize(width: 760, height: 520))
+    PreferencesWindowController.shared.show()
   }
   
+  @MainActor
   func openEditor(forPath imagePath: String) {
     let item = ShotQueueStore.shared.enqueue(path: imagePath)
     openEditor(itemID: item.id)
   }
 
+  @MainActor
+  func showQuickAction(forPath imagePath: String) {
+    let item = ShotQueueStore.shared.enqueue(path: imagePath)
+    MainWindowNavigation.shared.showQuickAction(itemID: item.id)
+    focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+  }
+
+  @MainActor
   func openEditor(itemID: UUID) {
     MainWindowNavigation.shared.openEditor(itemID: itemID)
     focusMainWindow(preferredContentSize: CGSize(width: 900, height: 650))
   }
   
+  @MainActor
   private func focusMainWindow(preferredContentSize: CGSize) {
     let window: NSWindow
     if let existingWindow = galleryWindow ?? existingMainWindow() {
@@ -230,22 +327,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     
     window.delegate = self
-    window.title = "QPARK Shot"
+    window.title = localized("app.name")
     window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 
   // MARK: - Window close confirmation
+  @MainActor
   func windowShouldClose(_ sender: NSWindow) -> Bool {
-    let alert = NSAlert()
-    alert.messageText = "Quit QPARK Shot?"
-    alert.informativeText = "Are you sure you want to close the app?"
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: "Quit")
-    alert.addButton(withTitle: "Cancel")
-    if alert.runModal() == .alertFirstButtonReturn {
-      NSApp.terminate(nil)
-    }
+    sender.orderOut(nil)
     return false
   }
   
@@ -272,94 +362,114 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   // MARK: - Capture Flow
   /// Triggers a capture. Pass `modeOverride` / `delayOverride` for one-shot menu actions
   /// without mutating saved settings.
+  @MainActor
   func triggerCaptureFlow(modeOverride: String? = nil, delayOverride: Int? = nil) {
+    let workspace = WorkspaceStore.shared
+    guard !workspace.isCapturing else { return }
+    workspace.isCapturing = true
+    workspace.presentStatus(localized("status.capturing"), autoDismiss: false)
+
     guard CGPreflightScreenCaptureAccess() else {
+      workspace.isCapturing = false
       let req = CGRequestScreenCaptureAccess()
       writeDebugLog("Request screen capture access returned: \(req)")
+      workspace.showPermissionRequired()
+      focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
 
-      // Attempt legacy prompt or Settings redirection if repeat request
-      if #available(macOS 12.3, *) {
-        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] _, _ in
-          DispatchQueue.main.async {
+      SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { _, _ in
+        Task { @MainActor in
             if Self.hasRequestedScreenCapturePermissionInSession {
-              self?.openScreenRecordingSettings()
+              AppDelegate.shared.openScreenRecordingSettings()
             }
             Self.hasRequestedScreenCapturePermissionInSession = true
-          }
         }
-      } else {
-        if Self.hasRequestedScreenCapturePermissionInSession {
-          openScreenRecordingSettings()
-        }
-        Self.hasRequestedScreenCapturePermissionInSession = true
       }
       return
     }
-
-    let url = FileManager.default.temporaryDirectory
-      .appendingPathComponent("qpark-shot-\(UUID().uuidString)")
-      .appendingPathExtension("png")
 
     let mainWindowWasVisible = galleryWindow?.isVisible ?? false
 
     galleryWindow?.orderOut(nil)
 
     let store = SettingsStore.shared
-    let mode = modeOverride ?? store.captureMode
+    let mode = CaptureMode(rawValue: modeOverride ?? store.captureMode) ?? .selection
     let delaySeconds = max(0, delayOverride ?? store.captureDelaySeconds)
 
-    var arguments: [String] = []
-    switch mode {
-    case "fullScreen":
-      arguments.append("-m") // capture only the main display
-    default:
-      arguments.append("-i") // interactive selection (default)
-    }
-    if delaySeconds > 0 {
-      arguments.append("-T")
-      arguments.append(String(delaySeconds))
-    }
-    arguments.append(url.path)
-
-    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-      guard let self = self else { return }
-
-      Thread.sleep(forTimeInterval: 0.25)
-
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-      process.arguments = arguments
-
-      do {
-        try process.run()
-        process.waitUntilExit()
-
-        let fileExists = FileManager.default.fileExists(atPath: url.path)
-
-        DispatchQueue.main.async {
-          if !fileExists {
-            if mainWindowWasVisible {
-              self.galleryWindow?.makeKeyAndOrderFront(nil)
-              NSApp.activate(ignoringOtherApps: true)
-            }
-            return
-          }
-
-          self.openEditor(forPath: url.path)
+    if mode == .repeatLastArea, store.lastCaptureRegion == nil {
+      RegionSelectionController.shared.selectRegion { [weak self] region in
+        guard let self else { return }
+        guard let region else {
+          WorkspaceStore.shared.isCapturing = false
+          self.restoreMainWindowIfNeeded(mainWindowWasVisible)
+          return
         }
-      } catch {
-        self.writeDebugLog("Screencapture run error: \(error.localizedDescription)")
-        DispatchQueue.main.async {
-          if mainWindowWasVisible {
-            self.galleryWindow?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+        store.lastCaptureRegion = region
+        store.save()
+        self.runCapture(
+          mode: .repeatLastArea,
+          delaySeconds: delaySeconds,
+          repeatRegion: region,
+          restoreMainWindowOnCancel: mainWindowWasVisible
+        )
+      }
+      return
+    }
+
+    runCapture(
+      mode: mode,
+      delaySeconds: delaySeconds,
+      repeatRegion: store.lastCaptureRegion,
+      restoreMainWindowOnCancel: mainWindowWasVisible
+    )
+  }
+
+  @MainActor
+  private func runCapture(
+    mode: CaptureMode,
+    delaySeconds: Int,
+    repeatRegion: CaptureRegion?,
+    restoreMainWindowOnCancel: Bool
+  ) {
+    let outputURL = CaptureService.shared.makeTemporaryOutputURL()
+    let request = CaptureRequest(
+      mode: mode,
+      delaySeconds: delaySeconds,
+      outputURL: outputURL,
+      repeatRegion: repeatRegion
+    )
+
+    CaptureService.shared.capture(request) { [weak self] result in
+      Task { @MainActor in
+        guard let self else { return }
+
+        switch result {
+        case .success(let url):
+          WorkspaceStore.shared.isCapturing = false
+          WorkspaceStore.shared.captured(path: url.path)
+          self.focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+        case .failure(let error):
+          WorkspaceStore.shared.isCapturing = false
+          self.writeDebugLog("Screencapture error: \(error)")
+          if error == .cancelledOrEmpty {
+            WorkspaceStore.shared.presentStatus(localized("status.capture_cancelled"), kind: .info)
+            self.restoreMainWindowIfNeeded(restoreMainWindowOnCancel)
+          } else {
+            WorkspaceStore.shared.showError(localized("status.capture_failed"))
+            self.focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
           }
         }
       }
     }
   }
+
+  @MainActor
+  private func restoreMainWindowIfNeeded(_ shouldRestore: Bool) {
+    guard shouldRestore else { return }
+    galleryWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
   
-  private func openScreenRecordingSettings() {
+  func openScreenRecordingSettings() {
     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
       NSWorkspace.shared.open(url)
     }
@@ -369,49 +479,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   func syncHotkeySettings() {
     unregisterAllGlobalShortcuts()
 
-    let key = "flutter.qpark_shot.app_settings.v1"
-    guard let jsonString = UserDefaults.standard.string(forKey: key),
-          let data = jsonString.data(using: .utf8),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      return
-    }
-
     let handlerStatus = ensureHotkeyEventHandlerInstalled()
     guard handlerStatus == noErr else { return }
 
-    // Selection (interactive) capture hotkey
-    if let hotkey = json["hotkey"] as? [String: Any] {
-      registerHotkey(from: hotkey, id: "captureSelection")
+    let settings = SettingsStore.shared.snapshot()
+    if settings.hotkey.validationError(comparedWith: settings.fullScreenHotkey) == nil {
+      registerHotkey(from: settings.hotkey, id: "captureSelection")
     }
-
-    // Full-screen capture hotkey
-    if let fsHotkey = json["fullScreenHotkey"] as? [String: Any] {
-      registerHotkey(from: fsHotkey, id: "captureFullScreen")
+    if settings.fullScreenHotkey.validationError(comparedWith: settings.hotkey) == nil {
+      registerHotkey(from: settings.fullScreenHotkey, id: "captureFullScreen")
     }
   }
 
-  private func registerHotkey(from hotkey: [String: Any], id: String) {
-    guard let enabled = hotkey["enabled"] as? Bool, enabled,
-          let keyChar = hotkey["key"] as? String, !keyChar.isEmpty,
-          let keyCode = keyCode(for: keyChar) else {
+  private func registerHotkey(from hotkey: HotkeySettings, id: String) {
+    guard hotkey.enabled,
+          hotkey.validationError() == nil,
+          let keyCode = keyCode(for: hotkey.key) else {
       return
     }
 
     var modifiers: UInt32 = 0
-    if let modifierList = hotkey["modifiers"] as? [String] {
-      for modifierName in modifierList {
-        switch modifierName.lowercased() {
-        case "control", "ctrl":
-          modifiers |= UInt32(controlKey)
-        case "shift":
-          modifiers |= UInt32(shiftKey)
-        case "alt", "option":
-          modifiers |= UInt32(optionKey)
-        case "meta", "cmd", "command":
-          modifiers |= UInt32(cmdKey)
-        default:
-          break
-        }
+    for modifierName in hotkey.modifiers {
+      switch modifierName.lowercased() {
+      case "control", "ctrl":
+        modifiers |= UInt32(controlKey)
+      case "shift":
+        modifiers |= UInt32(shiftKey)
+      case "alt", "option":
+        modifiers |= UInt32(optionKey)
+      case "meta", "cmd", "command":
+        modifiers |= UInt32(cmdKey)
+      default:
+        break
       }
     }
 
@@ -434,6 +533,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         ref: hotKeyRef)
       shortcutIDsByCarbonID[carbonID] = id
     }
+  }
+
+  private func applyMenuShortcut(_ shortcut: HotkeySettings, to item: NSMenuItem) {
+    guard shortcut.enabled, shortcut.validationError() == nil else { return }
+    item.keyEquivalent = shortcut.normalizedKey.lowercased()
+    var mask: NSEvent.ModifierFlags = []
+    for modifier in shortcut.normalizedModifiers {
+      switch modifier {
+      case "command": mask.insert(.command)
+      case "control": mask.insert(.control)
+      case "option": mask.insert(.option)
+      case "shift": mask.insert(.shift)
+      default: break
+      }
+    }
+    item.keyEquivalentModifierMask = mask
   }
   
   private func ensureHotkeyEventHandlerInstalled() -> OSStatus {
@@ -462,7 +577,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       &hotkeyEventHandler)
   }
   
-  private func handleHotkeyEvent(_ event: EventRef) -> OSStatus {
+  nonisolated private func handleHotkeyEvent(_ event: EventRef) -> OSStatus {
     var hotKeyID = EventHotKeyID(signature: 0, id: 0)
     let status = GetEventParameter(
       event,
@@ -476,13 +591,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       return status
     }
     
-    guard hotKeyID.signature == Self.hotKeySignature,
-          let shortcutID = shortcutIDsByCarbonID[hotKeyID.id]
-    else {
+    guard hotKeyID.signature == Self.hotKeySignature else {
       return OSStatus(eventNotHandledErr)
     }
 
-    DispatchQueue.main.async { [weak self] in
+    let carbonID = hotKeyID.id
+    Task { @MainActor [weak self] in
+      guard let shortcutID = self?.shortcutIDsByCarbonID[carbonID] else { return }
       switch shortcutID {
       case "captureFullScreen":
         self?.triggerCaptureFlow(modeOverride: "fullScreen")
