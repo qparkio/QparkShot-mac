@@ -3,6 +3,237 @@ import XCTest
 @testable import QPARK_Shot
 
 final class QPARKShotTests: XCTestCase {
+  func testAppStoresAndStorageAreIsolated() throws {
+    XCTAssertTrue(AppTestEnvironment.isEnabled)
+    let root = try XCTUnwrap(AppTestEnvironment.root).path
+    XCTAssertTrue(captureScratchFolderURL().path.hasPrefix(root))
+    XCTAssertTrue(storageFolderURL(isTemporary: true).path.hasPrefix(root))
+    XCTAssertTrue(storageFolderURL(isTemporary: false).path.hasPrefix(root))
+    XCTAssertFalse(AppTestEnvironment.defaults === UserDefaults.standard)
+    let path = root + "/isolated.png"
+    GalleryIndexStore.shared.toggleFavorite(path: path)
+    XCTAssertTrue(GalleryIndexStore(defaults: AppTestEnvironment.defaults).entry(for: path).favorite)
+  }
+
+  func testCropAndAnnotationsUndoRedoTogether() {
+    let store = EditorDraftStore()
+    let id = UUID()
+    let crop = CGRect(x: 10, y: 20, width: 100, height: 80)
+    let annotation = Annotation(type: .arrow, color: .red, strokeWidth: 4)
+    store.recordAnnotations([], cropRect: crop, for: id)
+    store.recordAnnotations([annotation], cropRect: crop, for: id)
+    store.undo(id)
+    XCTAssertEqual(store.draft(for: id).cropRect, crop)
+    XCTAssertTrue(store.draft(for: id).annotations.isEmpty)
+    store.undo(id)
+    XCTAssertNil(store.draft(for: id).cropRect)
+    store.redo(id)
+    XCTAssertEqual(store.draft(for: id).cropRect, crop)
+    store.recordAnnotations([], cropRect: nil, for: id)
+    XCTAssertTrue(store.draft(for: id).redoStack.isEmpty)
+  }
+
+  func testUnchangedDraftDoesNotBecomeDirtyAfterSave() {
+    let store = EditorDraftStore()
+    let id = UUID()
+    store.recordAnnotations([], cropRect: CGRect(x: 0, y: 0, width: 50, height: 50), for: id)
+    store.markSaved(id)
+    let draft = store.draft(for: id)
+    store.recordAnnotations(draft.annotations, cropRect: draft.cropRect, for: id)
+    XCTAssertFalse(store.draft(for: id).isDirty)
+    XCTAssertEqual(store.draft(for: id).undoStack.count, 2)
+  }
+
+  @MainActor
+  func testOCRProcessesBeyondFortyAndRetriesFailure() async {
+    let queue = OCRIndexingQueue()
+    let done = expectation(description: "all 65 images indexed")
+    done.expectedFulfillmentCount = 65
+    var attempts: [String: Int] = [:]
+    var completed: [String] = []
+    queue.start(paths: (0..<65).map(String.init), recognize: { path in
+      attempts[path, default: 0] += 1
+      return path == "0" && attempts[path] == 1 ? .failed("transient") : .succeeded(path)
+    }, started: { _ in }, completed: { path, result in
+      XCTAssertEqual(result, .succeeded(path))
+      completed.append(path)
+      done.fulfill()
+    })
+    await fulfillment(of: [done], timeout: 5)
+    XCTAssertEqual(completed.count, 65)
+    XCTAssertEqual(attempts["0"], 2)
+  }
+
+  @MainActor
+  func testOCRCancellationDiscardsOldCompletion() async {
+    let queue = OCRIndexingQueue()
+    let started = expectation(description: "old started")
+    let done = expectation(description: "new completed")
+    var release: CheckedContinuation<OCRService.OCRResult, Never>?
+    var completions: [String] = []
+    queue.start(paths: ["old"], recognize: { _ in
+      await withCheckedContinuation { continuation in
+        release = continuation
+        started.fulfill()
+      }
+    }, started: { _ in }, completed: { path, _ in completions.append(path) })
+    await fulfillment(of: [started], timeout: 2)
+    queue.start(paths: ["new"], recognize: { _ in .noText }, started: { _ in }, completed: { path, _ in
+      completions.append(path)
+      done.fulfill()
+    })
+    release?.resume(returning: .succeeded("stale"))
+    await fulfillment(of: [done], timeout: 2)
+    await Task.yield()
+    XCTAssertEqual(completions, ["new"])
+  }
+
+  @MainActor
+  func testOCRPersistentFailureIsBoundedAndDistinctFromNoText() async {
+    let queue = OCRIndexingQueue()
+    let done = expectation(description: "failure")
+    var attempts = 0
+    queue.start(paths: ["broken"], recognize: { _ in
+      attempts += 1
+      return .failed("decode")
+    }, started: { _ in }, completed: { _, result in
+      XCTAssertEqual(result, .failed("decode"))
+      done.fulfill()
+    })
+    await fulfillment(of: [done], timeout: 2)
+    XCTAssertEqual(attempts, 2)
+  }
+
+  @MainActor
+  func testSearchAndSectionKeepSelectionInsideVisibleResults() {
+    let store = WorkspaceStore.shared
+    let settings = SettingsStore.shared
+    let oldSearch = settings.gallerySearchIndexEnabled
+    settings.gallerySearchIndexEnabled = false
+    defer {
+      store.libraryShots = []
+      store.searchText = ""
+      settings.gallerySearchIndexEnabled = oldSearch
+    }
+    store.selectedSection = .library
+    store.libraryShots = ["first", "second"].map { name in
+      let path = "/test/\(name).png"
+      return LibraryShot(id: path, path: path, createdAt: Date(), entry: GalleryIndexEntry(path: path, fileName: name))
+    }
+    store.selectedLibraryPath = "/test/first.png"
+    store.searchText = "second"
+    XCTAssertEqual(store.selectedShot?.path, "/test/second.png")
+    XCTAssertEqual(store.selectedLibraryPath, "/test/second.png")
+    store.searchText = "no match"
+    XCTAssertNil(store.selectedShot)
+    XCTAssertNil(store.selectedLibraryPath)
+    store.searchText = ""
+    store.selectedSection = .favorites
+    XCTAssertNil(store.selectedShot)
+  }
+
+  func testCanvasCoordinatesRoundTripAcrossWindowSizes() {
+    let size = CGSize(width: 1920, height: 1080)
+    let point = CGPoint(x: 712, y: 420)
+    for available in [CGSize(width: 260, height: 420), CGSize(width: 900, height: 600), CGSize(width: 1600, height: 900)] {
+      let rect = fittedImageRect(imageSize: size, in: available)
+      XCTAssertEqual(rect.width / rect.height, size.width / size.height, accuracy: 0.0001)
+      let view = viewPoint(for: point, imageRect: rect, imageSize: size)
+      let restored = imagePoint(for: view, imageRect: rect, imageSize: size)
+      XCTAssertEqual(restored.x, point.x, accuracy: 0.0001)
+      XCTAssertEqual(restored.y, point.y, accuracy: 0.0001)
+    }
+  }
+
+  func testCaptureCoordinatesHandleMonitorsAboveAndLeft() {
+    XCTAssertEqual(captureRect(fromAppKit: CGRect(x: 40, y: 700, width: 200, height: 100), primaryTop: 900), CGRect(x: 40, y: 100, width: 200, height: 100))
+    XCTAssertEqual(captureRect(fromAppKit: CGRect(x: -500, y: 950, width: 200, height: 100), primaryTop: 900), CGRect(x: -500, y: -150, width: 200, height: 100))
+  }
+
+  func testCleanupRechecksLiveProtectionBeforeMutation() async throws {
+    let root = try XCTUnwrap(AppTestEnvironment.root).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = root.appendingPathComponent("active.png")
+    try Data("keep".utf8).write(to: file)
+    try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: file.path)
+    let service = CleanupService()
+    let report = await service.run(policy: CleanupPolicy(mode: .afterDuration, maxAge: 60, includeSavedFiles: false), galleryEntries: [], activePaths: [], temporaryRoots: [root], savedRoots: [], allowsMutation: { _, _ in false })
+    XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    XCTAssertFalse(report.changedAnything)
+  }
+
+  func testBlurUsesSelectedTopRegionAndCropKeepsPixelSize() throws {
+    let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 160, pixelsHigh: 120, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+    for y in 0..<120 {
+      for x in 0..<160 { bitmap.setColor(y < 60 ? NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1) : NSColor(deviceRed: 0, green: 0, blue: 1, alpha: 1), atX: x, y: y) }
+    }
+    let source = NSImage(size: NSSize(width: 160, height: 120))
+    source.addRepresentation(bitmap)
+    let blur = Annotation(type: .blur, color: .gray, strokeWidth: 4, rect: CGRect(x: 10, y: 10, width: 100, height: 40))
+    let rendered = try XCTUnwrap(ExportService.shared.render(ExportContext(image: source, annotations: [blur], cropRect: nil, preset: .clean, watermark: .disabled)))
+    let data = try XCTUnwrap(ExportService.shared.pngData(from: rendered))
+    let decoded = try XCTUnwrap(NSBitmapImageRep(data: data))
+    let color = try XCTUnwrap(decoded.colorAt(x: 60, y: 30)?.usingColorSpace(.deviceRGB))
+    XCTAssertGreaterThan(color.redComponent, 0.9)
+    XCTAssertLessThan(color.blueComponent, 0.1)
+    let cropped = try XCTUnwrap(ExportService.shared.render(ExportContext(image: source, annotations: [], cropRect: CGRect(x: 10, y: 10, width: 80, height: 30), preset: .clean, watermark: .disabled)))
+    XCTAssertEqual(cropped.size, NSSize(width: 80, height: 30))
+  }
+
+  func testExportFallsBackFromUnavailableFolderAndReopensIdentically() throws {
+    let root = try XCTUnwrap(AppTestEnvironment.root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let blocked = root.appendingPathComponent("not-a-directory")
+    try Data("blocked".utf8).write(to: blocked)
+    let settings = SettingsStore.shared
+    let oldDirectory = settings.saveDirectory
+    settings.saveDirectory = blocked.path
+    defer {
+      settings.saveDirectory = oldDirectory
+      try? FileManager.default.removeItem(at: blocked)
+    }
+    let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 20, pixelsHigh: 10, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+    for y in 0..<10 { for x in 0..<20 { bitmap.setColor(NSColor(deviceRed: 0, green: 0, blue: 0, alpha: 0), atX: x, y: y) } }
+    bitmap.setColor(NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), atX: 5, y: 5)
+    let image = NSImage(size: NSSize(width: 20, height: 10))
+    image.addRepresentation(bitmap)
+    let data = try XCTUnwrap(ExportService.shared.pngData(from: image))
+    let path = try XCTUnwrap(ExportService.shared.save(pngData: data, isTemporary: false, preset: .clean, filenameTemplate: "fallback-test"))
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    XCTAssertTrue(path.hasPrefix(root.path))
+    XCTAssertFalse(path.hasPrefix(blocked.path))
+    XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), data)
+    let reopened = try XCTUnwrap(loadImageForRendering(path: path))
+    XCTAssertEqual(reopened.size, image.size)
+    let decoded = try XCTUnwrap(NSBitmapImageRep(data: data))
+    XCTAssertEqual(decoded.colorAt(x: 0, y: 0)?.alphaComponent, 0)
+  }
+
+  func testOCRCacheInvalidatesForFileLanguageAndEngineChanges() {
+    let date = Date()
+    var entry = GalleryIndexEntry(path: "/test.png", fileName: "test.png", ocrIndexedAt: date, ocrLanguageSignature: "en-US", ocrEngineVersion: OCRService.indexVersion)
+    entry.ocrSourceModifiedAt = date
+    XCTAssertFalse(entry.needsOCR(languageSignature: "en-US", modifiedAt: date))
+    XCTAssertTrue(entry.needsOCR(languageSignature: "ru-RU", modifiedAt: date))
+    XCTAssertTrue(entry.needsOCR(languageSignature: "en-US", modifiedAt: date.addingTimeInterval(1)))
+    entry.ocrEngineVersion = 2
+    XCTAssertTrue(entry.needsOCR(languageSignature: "en-US", modifiedAt: date))
+  }
+
+  func testFolderBookmarkResolvesImageNotFolder() throws {
+    let root = try XCTUnwrap(AppTestEnvironment.root).appendingPathComponent("bookmark-test")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = root.appendingPathComponent("image.png")
+    try Data("fixture".utf8).write(to: file)
+    let bookmark = try root.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    let access = securityScopedImageAccess(url: file, bookmarkData: nil, folders: [StorageFolderCandidate(url: root, bookmarkData: bookmark)])
+    defer { access.stop() }
+    XCTAssertEqual(access.url.standardizedFileURL, file.standardizedFileURL)
+    XCTAssertEqual(try Data(contentsOf: access.url), Data("fixture".utf8))
+  }
+
   func testAppSettingsDefaultsIncludeNewFeatureSections() {
     let settings = AppSettings()
 

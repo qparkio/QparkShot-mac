@@ -244,15 +244,17 @@ struct StorageFolderCandidate {
 struct SecurityScopedAccess {
   let url: URL
   private let didStartAccessing: Bool
+  private let scopeURL: URL?
 
-  init(url: URL, didStartAccessing: Bool) {
+  init(url: URL, didStartAccessing: Bool, scopeURL: URL? = nil) {
     self.url = url
     self.didStartAccessing = didStartAccessing
+    self.scopeURL = scopeURL
   }
 
   func stop() {
     if didStartAccessing {
-      url.stopAccessingSecurityScopedResource()
+      (scopeURL ?? url).stopAccessingSecurityScopedResource()
     }
   }
 }
@@ -279,6 +281,29 @@ func securityScopedAccess(url: URL, bookmarkData: Data?) -> SecurityScopedAccess
   }
 }
 
+/// A folder bookmark grants access to its descendants, but resolves to the folder itself.
+func securityScopedImageAccess(
+  url: URL,
+  bookmarkData: Data?,
+  folders: [StorageFolderCandidate]
+) -> SecurityScopedAccess {
+  if bookmarkData != nil { return securityScopedAccess(url: url, bookmarkData: bookmarkData) }
+  let filePath = url.standardizedFileURL.path
+  for folder in folders {
+    let root = folder.url.standardizedFileURL.path
+    guard filePath.hasPrefix(root + "/"), let bookmark = folder.bookmarkData else { continue }
+    var stale = false
+    guard let resolved = try? URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale) else { continue }
+    let relative = String(filePath.dropFirst(root.count + 1))
+    return SecurityScopedAccess(
+      url: resolved.appendingPathComponent(relative),
+      didStartAccessing: resolved.startAccessingSecurityScopedResource(),
+      scopeURL: resolved
+    )
+  }
+  return SecurityScopedAccess(url: url, didStartAccessing: false)
+}
+
 func storageFolderURL(isTemporary: Bool, fileManager: FileManager = .default) -> URL {
   storageFolderURLs(isTemporary: isTemporary, fileManager: fileManager)[0]
 }
@@ -291,7 +316,7 @@ func storageFolderCandidates(isTemporary: Bool, fileManager: FileManager = .defa
   if isTemporary {
     return [
       StorageFolderCandidate(
-        url: fileManager.temporaryDirectory
+        url: (AppTestEnvironment.root ?? fileManager.temporaryDirectory)
           .appendingPathComponent("QPARK Shot", isDirectory: true)
           .appendingPathComponent("Export Scratch", isDirectory: true),
         bookmarkData: nil
@@ -330,6 +355,13 @@ func galleryStorageFolderCandidates(
         bookmarkData: bookmarkData
       )
     )
+  }
+
+  if let root = AppTestEnvironment.root {
+    candidates.append(StorageFolderCandidate(
+      url: root.appendingPathComponent("Pictures/QPARK Shot", isDirectory: true), bookmarkData: nil
+    ))
+    return candidates
   }
 
   let pictures = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first!

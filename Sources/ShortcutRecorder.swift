@@ -67,6 +67,8 @@ private struct ShortcutRecorderButton: NSViewRepresentable {
     context.coordinator.parent = self
     if !context.coordinator.isRecording {
       button.title = hotkeyDisplayString(shortcut)
+      button.setAccessibilityLabel(localized("settings.record_shortcut"))
+      button.setAccessibilityValue(hotkeyDisplayString(shortcut))
     }
   }
 

@@ -4,6 +4,8 @@ import Foundation
 struct GalleryFileSnapshot: Equatable {
   let path: String
   let createdAt: Date
+  var modifiedAt: Date? = nil
+  var securityBookmarkData: Data? = nil
 }
 
 struct GalleryIndexEntry: Codable, Equatable, Identifiable {
@@ -13,6 +15,7 @@ struct GalleryIndexEntry: Codable, Equatable, Identifiable {
   var tags: [String]
   var ocrText: String
   var updatedAt: Date
+  var ocrSourceModifiedAt: Date? = nil
   var ocrIndexedAt: Date?
   var ocrLanguageSignature: String?
   var ocrEngineVersion: Int?
@@ -23,6 +26,11 @@ struct GalleryIndexEntry: Codable, Equatable, Identifiable {
 
   var id: String { path }
   var isMissing: Bool { missingSince != nil }
+
+  func needsOCR(languageSignature: String, modifiedAt: Date?) -> Bool {
+    ocrIndexedAt == nil || ocrLanguageSignature != languageSignature
+      || ocrEngineVersion != OCRService.indexVersion || ocrSourceModifiedAt != modifiedAt
+  }
 
   init(
     path: String,
@@ -56,7 +64,7 @@ struct GalleryIndexEntry: Codable, Equatable, Identifiable {
 }
 
 final class GalleryIndexStore: ObservableObject {
-  static let shared = GalleryIndexStore()
+  static let shared = GalleryIndexStore(defaults: AppTestEnvironment.defaults)
 
   @Published private(set) var entries: [String: GalleryIndexEntry] = [:]
 
@@ -108,6 +116,7 @@ final class GalleryIndexStore: ObservableObject {
       var value = entry(for: path)
       value.path = path
       value.fileName = URL(fileURLWithPath: path).lastPathComponent
+      if let bookmark = snapshot.securityBookmarkData { value.securityBookmarkData = bookmark }
       value.lastKnownCreatedAt = snapshot.createdAt
       value.lastSeenAt = now
       value.missingSince = nil
@@ -190,11 +199,13 @@ final class GalleryIndexStore: ObservableObject {
     _ text: String,
     for path: String,
     languageSignature: String? = nil,
-    engineVersion: Int? = nil
+    engineVersion: Int? = nil,
+    sourceModifiedAt: Date? = nil
   ) {
     var value = entry(for: path)
     value.ocrText = text
     value.ocrIndexedAt = Date()
+    value.ocrSourceModifiedAt = sourceModifiedAt
     value.ocrLanguageSignature = languageSignature
     value.ocrEngineVersion = engineVersion
     value.updatedAt = Date()

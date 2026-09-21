@@ -49,3 +49,6 @@ docs/
 *.p12
 *.pem
 *.provisionprofile
+
+# Local audit evidence
+/AUDIT.md

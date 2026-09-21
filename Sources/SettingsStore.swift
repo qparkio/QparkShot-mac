@@ -1,6 +1,30 @@
 import Cocoa
 import SwiftUI
 
+// A single isolated environment is shared by the test host and all app stores.
+enum AppTestEnvironment {
+  static let isEnabled: Bool = {
+#if DEBUG
+    return ProcessInfo.processInfo.arguments.contains("--ui-test-scenario")
+      || ProcessInfo.processInfo.environment["QPARK_SHOT_TESTING"] == "1"
+      || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+      || NSClassFromString("XCTestCase") != nil
+#else
+    return false
+#endif
+  }()
+  static func value(_ key: String) -> String? {
+    isEnabled ? ProcessInfo.processInfo.environment[key] : nil
+  }
+
+  static let identifier = UUID().uuidString
+  static let defaults: UserDefaults = isEnabled
+    ? UserDefaults(suiteName: "com.qpark.shot.tests.\(identifier)")! : .standard
+  static let root: URL? = isEnabled
+    ? FileManager.default.temporaryDirectory.appendingPathComponent("QPARK Shot Tests/\(identifier)", isDirectory: true)
+    : nil
+}
+
 struct SettingsEffects: OptionSet, Equatable {
   let rawValue: Int
 
@@ -126,14 +150,10 @@ final class SettingsStore: ObservableObject {
   }
 
   private init() {
-    if ProcessInfo.processInfo.arguments.contains("--ui-test-scenario"),
-       let isolatedDefaults = UserDefaults(suiteName: "com.qpark.shot.ui-tests") {
-      isolatedDefaults.removePersistentDomain(forName: "com.qpark.shot.ui-tests")
-      defaults = isolatedDefaults
-    } else {
-      defaults = .standard
-    }
+    defaults = AppTestEnvironment.defaults
     load()
+    if let language = AppTestEnvironment.value("QPARK_TEST_LANGUAGE") { appLanguageCode = language }
+    if let theme = AppTestEnvironment.value("QPARK_TEST_THEME") { themePreference = theme }
   }
 
   func load() {
@@ -229,6 +249,14 @@ final class SettingsStore: ObservableObject {
     if effects.contains(.library) {
       WorkspaceStore.shared.loadLibrary()
     }
+  }
+
+  @MainActor
+  func flushPendingPersistence() {
+    guard pendingPersistence != nil else { return }
+    pendingPersistence?.cancel()
+    pendingPersistence = nil
+    SettingsStorage.save(snapshot(), defaults: defaults)
   }
 
   @MainActor

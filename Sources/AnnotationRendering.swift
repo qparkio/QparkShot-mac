@@ -31,6 +31,7 @@ struct DrawingCanvas: View {
   @Binding var cropRect: CGRect?
   let onAction: () -> Void
 
+  @State private var renderedAnnotations: NSImage?
   @State private var currentPoints: [CGPoint] = []
   @State private var dragStart: CGPoint?
   @State private var dragCurrent: CGPoint?
@@ -41,7 +42,7 @@ struct DrawingCanvas: View {
       let imageScale = imageRect.width / max(image.size.width, 1)
 
       ZStack {
-        Image(nsImage: image)
+        Image(nsImage: renderedAnnotations ?? image)
           .resizable()
           .frame(width: imageRect.width, height: imageRect.height)
           .position(x: imageRect.midX, y: imageRect.midY)
@@ -52,27 +53,39 @@ struct DrawingCanvas: View {
           drawingContext.translateBy(x: imageRect.minX, y: imageRect.minY)
           drawingContext.scaleBy(x: imageScale, y: imageScale)
 
-          drawSavedAnnotations(in: &drawingContext)
           drawActiveGesture(in: &drawingContext)
         }
 
-        ForEach(annotations) { annotation in
-          if annotation.type == .text, let firstPoint = annotation.points.first {
-            Text(annotation.text)
-              .font(.system(size: (annotation.strokeWidth * 3 + 12) * imageScale))
-              .foregroundColor(annotation.color)
-              .position(
-                viewPoint(
-                  for: firstPoint,
-                  imageRect: imageRect,
-                  imageSize: image.size
-                )
-              )
-              .allowsHitTesting(false)
+        if let cropRect {
+          let crop = CGRect(
+            x: imageRect.minX + cropRect.minX * imageScale,
+            y: imageRect.minY + cropRect.minY * imageScale,
+            width: cropRect.width * imageScale,
+            height: cropRect.height * imageScale
+          )
+          Path { path in
+            path.addRect(imageRect)
+            path.addRect(crop)
           }
+          .fill(.black.opacity(0.4), style: FillStyle(eoFill: true))
+          .allowsHitTesting(false)
+          Path(crop).stroke(.white, style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+            .allowsHitTesting(false)
         }
       }
       .gesture(canvasGesture(in: imageRect, imageSize: image.size))
+    }
+    .task(id: annotations) {
+      let snapshot = annotations
+      let source = image
+      let rendered = await Task.detached(priority: .userInitiated) {
+        ExportService.shared.render(ExportContext(
+          image: source, annotations: snapshot, cropRect: nil,
+          preset: .clean, watermark: .disabled
+        ))
+      }.value
+      guard !Task.isCancelled else { return }
+      renderedAnnotations = rendered
     }
   }
 
@@ -194,7 +207,9 @@ struct DrawingCanvas: View {
       )
       onAction()
     case .select:
-      cropRect = CGRect(from: start, to: end)
+      let rect = CGRect(from: start, to: end).standardized
+      guard rect.width >= 1, rect.height >= 1 else { return }
+      cropRect = rect
       onAction()
     }
   }
@@ -205,51 +220,6 @@ struct DrawingCanvas: View {
       .map(\.calloutNumber)
       .max() ?? 0
     return highestNumber + 1
-  }
-
-  private func drawSavedAnnotations(in context: inout GraphicsContext) {
-    for annotation in annotations {
-      var path = Path()
-      switch annotation.type {
-      case .freehand:
-        if annotation.points.count > 1 {
-          path.addLines(annotation.points)
-          context.stroke(path, with: .color(annotation.color), lineWidth: annotation.strokeWidth)
-        }
-      case .rectangle:
-        path.addRect(annotation.rect)
-        context.stroke(path, with: .color(annotation.color), lineWidth: annotation.strokeWidth)
-      case .arrow:
-        if annotation.points.count == 2 {
-          drawArrow(
-            in: &context,
-            from: annotation.points[0],
-            to: annotation.points[1],
-            color: annotation.color,
-            width: annotation.strokeWidth
-          )
-        }
-      case .redact:
-        path.addRect(annotation.rect)
-        context.fill(path, with: .color(.black.opacity(0.92)))
-      case .blur:
-        path.addRect(annotation.rect)
-        context.fill(path, with: .color(.secondary.opacity(0.45)))
-        context.stroke(path, with: .color(.white.opacity(0.7)), style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
-      case .callout:
-        if let point = annotation.points.first {
-          drawCallout(
-            in: &context,
-            center: point,
-            number: annotation.calloutNumber,
-            color: annotation.color,
-            width: annotation.strokeWidth
-          )
-        }
-      default:
-        break
-      }
-    }
   }
 
   private func drawActiveGesture(in context: inout GraphicsContext) {
@@ -614,13 +584,13 @@ private func renderBlur(
   let renderRect = flippedRenderRect(annotation.rect, imageHeight: imageHeight)
   guard renderRect.width >= 2,
         renderRect.height >= 2,
-        let cropped = sourceCGImage.cropping(to: renderRect) else {
+        let cropped = sourceCGImage.cropping(to: annotation.rect.standardized) else {
     return
   }
 
   let input = CIImage(cgImage: cropped)
   let filter = CIFilter(name: "CIGaussianBlur")
-  filter?.setValue(input, forKey: kCIInputImageKey)
+  filter?.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
   filter?.setValue(12.0, forKey: kCIInputRadiusKey)
 
   guard let output = filter?.outputImage?.cropped(to: input.extent),

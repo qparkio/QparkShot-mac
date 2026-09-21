@@ -146,7 +146,7 @@ final class CaptureService {
 }
 
 func captureScratchFolderURL(fileManager: FileManager = .default) -> URL {
-  fileManager.temporaryDirectory
+  (AppTestEnvironment.root ?? fileManager.temporaryDirectory)
     .appendingPathComponent("QPARK Shot", isDirectory: true)
     .appendingPathComponent("Capture Scratch", isDirectory: true)
 }
@@ -167,7 +167,7 @@ final class RegionSelectionController {
       partial.union(screen.frame)
     }
     guard !screenFrame.isNull else {
-      completion(nil)
+      finish(with: nil)
       return
     }
 
@@ -180,10 +180,11 @@ final class RegionSelectionController {
       }
       let windowRect = view.convert(rect, to: nil)
       let screenRect = window.convertToScreen(windowRect)
-      self.finish(with: CaptureRegion(rect: screenRect))
+      let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+      self.finish(with: CaptureRegion(rect: captureRect(fromAppKit: screenRect, primaryTop: primaryTop)))
     }
 
-    let window = NSWindow(
+    let window = RegionSelectionWindow(
       contentRect: screenFrame,
       styleMask: [.borderless],
       backing: .buffered,
@@ -212,6 +213,10 @@ final class RegionSelectionController {
     completion = nil
     callback?(region)
   }
+}
+
+private final class RegionSelectionWindow: NSWindow {
+  override var canBecomeKey: Bool { true }
 }
 
 private final class RegionSelectionView: NSView {
@@ -273,4 +278,9 @@ private final class RegionSelectionView: NSView {
       super.keyDown(with: event)
     }
   }
+}
+
+// screencapture uses a top-left origin, while AppKit screen coordinates point up.
+func captureRect(fromAppKit rect: CGRect, primaryTop: CGFloat) -> CGRect {
+  CGRect(x: rect.minX, y: primaryTop - rect.maxY, width: rect.width, height: rect.height)
 }

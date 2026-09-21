@@ -1,11 +1,16 @@
 import Combine
 import Foundation
 
+struct EditorSnapshot: Equatable {
+  var annotations: [Annotation] = []
+  var cropRect: CGRect? = nil
+}
+
 struct EditorDraft: Equatable {
   var annotations: [Annotation] = []
   var cropRect: CGRect? = nil
-  var undoStack: [[Annotation]] = [[]]
-  var redoStack: [[Annotation]] = []
+  var undoStack: [EditorSnapshot] = [EditorSnapshot()]
+  var redoStack: [EditorSnapshot] = []
   var isDirty: Bool = false
   var updatedAt: Date = Date()
 }
@@ -15,15 +20,10 @@ final class EditorDraftStore: ObservableObject {
 
   @Published private(set) var drafts: [UUID: EditorDraft] = [:]
 
-  private init() {}
+  init() {}
 
   func draft(for itemID: UUID) -> EditorDraft {
-    if let draft = drafts[itemID] {
-      return draft
-    }
-    let draft = EditorDraft()
-    drafts[itemID] = draft
-    return draft
+    drafts[itemID] ?? EditorDraft()
   }
 
   func update(_ itemID: UUID, _ mutate: (inout EditorDraft) -> Void) {
@@ -35,12 +35,33 @@ final class EditorDraftStore: ObservableObject {
 
   func recordAnnotations(_ annotations: [Annotation], cropRect: CGRect?, for itemID: UUID) {
     update(itemID) { draft in
-      if draft.undoStack.last != annotations {
-        draft.undoStack.append(annotations)
-      }
+      let snapshot = EditorSnapshot(annotations: annotations, cropRect: cropRect)
+      guard draft.undoStack.last != snapshot else { return }
+      draft.undoStack.append(snapshot)
       draft.annotations = annotations
       draft.cropRect = cropRect
       draft.redoStack.removeAll()
+      draft.isDirty = true
+    }
+  }
+
+  func undo(_ itemID: UUID) {
+    update(itemID) { draft in
+      guard draft.undoStack.count > 1 else { return }
+      draft.redoStack.append(draft.undoStack.removeLast())
+      let previous = draft.undoStack.last!
+      draft.annotations = previous.annotations
+      draft.cropRect = previous.cropRect
+      draft.isDirty = true
+    }
+  }
+
+  func redo(_ itemID: UUID) {
+    update(itemID) { draft in
+      guard let next = draft.redoStack.popLast() else { return }
+      draft.undoStack.append(next)
+      draft.annotations = next.annotations
+      draft.cropRect = next.cropRect
       draft.isDirty = true
     }
   }

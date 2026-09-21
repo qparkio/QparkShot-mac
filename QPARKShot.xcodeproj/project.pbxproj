@@ -481,7 +481,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = QJ4229DPLG;
 				ENABLE_APP_SANDBOX = YES;
@@ -495,8 +495,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 			);
-				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.qpark.shot;
+				MARKETING_VERSION = 1.2.0;
+				QPARK_SHOT_APP_BUNDLE_ID = com.qpark.shot;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(QPARK_SHOT_APP_BUNDLE_ID)";
 				PRODUCT_COPYRIGHT = "Copyright © 2026 QPARK";
 				PRODUCT_MODULE_NAME = QPARK_Shot;
 				PRODUCT_NAME = "QPARK Shot";
@@ -514,9 +515,10 @@
 				CODE_SIGN_IDENTITY = "Developer ID Application";
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				OTHER_CODE_SIGN_FLAGS = "--timestamp";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = QJ4229DPLG;
 				ENABLE_APP_SANDBOX = YES;
@@ -530,8 +532,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 			);
-				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.qpark.shot;
+				MARKETING_VERSION = 1.2.0;
+				QPARK_SHOT_APP_BUNDLE_ID = com.qpark.shot;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(QPARK_SHOT_APP_BUNDLE_ID)";
 				PRODUCT_COPYRIGHT = "Copyright © 2026 QPARK";
 				PRODUCT_MODULE_NAME = QPARK_Shot;
 				PRODUCT_NAME = "QPARK Shot";

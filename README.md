@@ -11,7 +11,7 @@
 <p align="center">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-14%2B-111111">
   <img alt="Swift" src="https://img.shields.io/badge/Swift-5-orange">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.2.0-blue">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
@@ -55,6 +55,10 @@ The app is intentionally simple from an infrastructure point of view: no analyti
 - Keep current-session captures in an optional editor buffer sidebar.
 - Automatically clean temporary files based on local cleanup preferences.
 
+## Download
+
+Download the signed, notarized macOS installer or application archive from [GitHub Releases](https://github.com/qparkio/QparkShot-mac/releases/latest). The universal build supports Apple Silicon and Intel Macs. Installing the update preserves your screenshots and preferences.
+
 ## Requirements
 
 - macOS 14 or later
@@ -82,6 +86,24 @@ xcodebuild -project QPARKShot.xcodeproj \
 ```
 
 Generated build output is written under `./build`, which is ignored by Git.
+
+## Tests and audit
+
+Use a separate app identity so UI automation cannot terminate the installed app. Run the two suites sequentially; UI automation needs the desktop while it runs.
+
+```sh
+xcodebuild -project QPARKShot.xcodeproj -scheme "QPARK Shot" \
+  -configuration Debug -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath /tmp/qpark-shot-tests \
+  QPARK_SHOT_APP_BUNDLE_ID=com.qpark.shot.audit test
+
+xcodebuild -project QPARKShot.xcodeproj -scheme "QPARK Shot UI Tests" \
+  -configuration Debug -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath /tmp/qpark-shot-ui-tests \
+  QPARK_SHOT_APP_BUNDLE_ID=com.qpark.shot.audit test
+```
+
+Test mode uses a unique preferences suite and temporary image roots. Automatic cleanup and global shortcut registration are disabled in the UI host. Fixtures and screenshots do not prove real Screen Recording permission or capture on multiple physical displays. See [CHANGELOG.md](CHANGELOG.md) for changes and validation limits.
 
 ## Permissions
 
@@ -115,9 +137,11 @@ Saved screenshots are written locally to `~/Pictures/QPARK Shot` unless the user
 ```text
 QPARKShot.xcodeproj/      Xcode project and shared scheme
 Sources/                  App source, Info.plist, entitlements, and app icon
+Tests/                    Unit and regression tests
+UITests/                  Native UI scenarios and layout screenshots
 ```
 
-The public repository intentionally keeps the source tree small. Local helper scripts, local documentation pages, tests, generated build output, packaged apps, archives, signing material, provisioning profiles, private keys, and environment files are excluded by `.gitignore`.
+The public repository intentionally keeps the source tree small. Local helper scripts, local documentation pages, generated build output, packaged apps, archives, signing material, provisioning profiles, private keys, and environment files are excluded by `.gitignore`.
 
 ## Before Publishing
 
@@ -125,7 +149,7 @@ Before pushing or tagging a public release, verify the repository contains only 
 
 ```sh
 git status --short
-git check-ignore -v build scripts docs Tests "build/Release/QPARK Shot.app" || true
+git check-ignore -v build scripts docs "build/Release/QPARK Shot.app" || true
 ```
 
 For App Store or notarized distribution, use a production signing configuration and make sure debug-only entitlements such as `com.apple.security.get-task-allow` are not enabled in the release binary.

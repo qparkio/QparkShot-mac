@@ -36,10 +36,12 @@ final class MainAppWindow: NSWindow {
 
     identifier = Self.mainWindowIdentifier
     isReleasedWhenClosed = false
+    isRestorable = !AppTestEnvironment.isEnabled
     minSize = NSSize(width: 920, height: 620)
 
     let rootView = WorkspaceRootView(store: WorkspaceStore.shared)
     let hostingController = NSHostingController(rootView: rootView)
+    hostingController.sizingOptions = []
     let windowFrame = frame
     contentViewController = hostingController
     setFrame(windowFrame, display: true)
@@ -50,30 +52,13 @@ final class MainAppWindow: NSWindow {
     if styleMask.contains(.fullSizeContentView) {
       styleMask.remove(.fullSizeContentView)
     }
-    isOpaque = false
-    backgroundColor = .clear
-
-    let visualEffectView = NSVisualEffectView()
-    visualEffectView.translatesAutoresizingMaskIntoConstraints = false
-    visualEffectView.material = .underWindowBackground
-    visualEffectView.state = .active
-    visualEffectView.blendingMode = .behindWindow
-
-    if let windowContentView = contentView {
-      windowContentView.addSubview(visualEffectView, positioned: .below, relativeTo: hostingController.view)
-      NSLayoutConstraint.activate([
-        visualEffectView.leadingAnchor.constraint(equalTo: windowContentView.leadingAnchor),
-        visualEffectView.trailingAnchor.constraint(equalTo: windowContentView.trailingAnchor),
-        visualEffectView.topAnchor.constraint(equalTo: windowContentView.topAnchor),
-        visualEffectView.bottomAnchor.constraint(equalTo: windowContentView.bottomAnchor)
-      ])
-    }
+    isOpaque = true
+    backgroundColor = .windowBackgroundColor
   }
 }
 
 struct WorkspaceRootView: View {
   @ObservedObject var store: WorkspaceStore
-  @ObservedObject private var settings = SettingsStore.shared
   @ObservedObject private var localization = LocalizationController.shared
   @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
@@ -102,14 +87,16 @@ struct WorkspaceRootView: View {
         text: $store.searchText
       )
     )
-    .inspector(isPresented: $store.isInspectorVisible) {
+    .inspector(isPresented: Binding(
+      get: { store.isInspectorVisible && store.selectedSection != .currentSession },
+      set: { if store.selectedSection != .currentSession { store.isInspectorVisible = $0 } }
+    )) {
       WorkspaceInspector(store: store)
         .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
     }
     .background {
       VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow)
     }
-    .preferredColorScheme(settings.preferredColorScheme)
     .environment(\.locale, localization.locale)
     .environment(\.layoutDirection, localization.layoutDirection)
     .onAppear {
@@ -172,9 +159,10 @@ private struct WorkspaceToolbar: ToolbarContent {
       } label: {
         Image(systemName: "sidebar.right")
       }
+      .disabled(store.selectedSection == .currentSession)
       .help(localized("workspace.inspector"))
       .accessibilityLabel(localized("workspace.inspector"))
-      .accessibilityValue(store.isInspectorVisible ? localized("status.visible") : localized("status.hidden"))
+      .accessibilityValue(store.isInspectorVisible && store.selectedSection != .currentSession ? localized("status.visible") : localized("status.hidden"))
     }
   }
 }
@@ -191,6 +179,8 @@ private struct WorkspaceSidebar: View {
         ForEach(WorkspaceSection.allCases) { section in
           HStack(spacing: 8) {
             Label(localized(section.titleKey), systemImage: section.iconName)
+              .lineLimit(2)
+              .fixedSize(horizontal: false, vertical: true)
             Spacer()
             if section == .currentSession, !queue.items.isEmpty {
               Text("\(queue.items.count)")
@@ -298,9 +288,9 @@ private struct WorkspaceDetail: View {
         case .library:
           LibraryWorkspaceView(store: store)
         case .captureReview(let itemID):
-          CaptureReviewView(itemID: itemID, store: store)
+          CaptureReviewView(itemID: itemID, store: store).id(itemID)
         case .editor(let itemID):
-          EditorWorkspaceView(itemID: itemID, store: store)
+          EditorWorkspaceView(itemID: itemID, store: store).id(itemID)
         case .permissionRequired:
           PermissionRequiredView()
         case .error(let message):
@@ -477,10 +467,15 @@ private struct WorkspaceShotTile: View {
         }
       }
       .buttonStyle(.plain)
+      .focusable()
       .focused(focus, equals: shot.path)
       .simultaneousGesture(TapGesture(count: 2).onEnded(onOpen))
       .onKeyPress(.return) {
         onOpen()
+        return .handled
+      }
+      .onKeyPress(.space) {
+        onSelect()
         return .handled
       }
       .onMoveCommand(perform: onMoveFocus)
@@ -546,13 +541,7 @@ private struct WorkspaceShotTile: View {
   }
 
   private func activate() {
-    let eventType = NSApp.currentEvent?.type
-    let isMouseActivation = eventType == .leftMouseDown || eventType == .leftMouseUp
-    if isSelected && !isMouseActivation {
-      onOpen()
-    } else {
-      onSelect()
-    }
+    onSelect()
   }
 
   private func loadThumbnail() {
@@ -792,43 +781,12 @@ private struct CaptureReviewView: View {
         ImagePreview(image: previewImage ?? image, cornerRadius: 10)
           .frame(maxWidth: 760, maxHeight: 430)
 
-        HStack(spacing: 10) {
-          Button {
-            copy()
-          } label: {
-            Label(localized("common.copy"), systemImage: "doc.on.doc")
-          }
-          .buttonStyle(.borderedProminent)
-          .accessibilityIdentifier("review.copy")
-
-          Button {
-            if let item {
-              store.openEditor(itemID: item.id)
-            }
-          } label: {
-            Label(localized("settings.open_editor"), systemImage: "pencil.and.outline")
-          }
-
-          Button {
-            save()
-          } label: {
-            Label(localized("common.save"), systemImage: "square.and.arrow.down")
-          }
-
-          Button {
-            share()
-          } label: {
-            Label(localized("common.share"), systemImage: "square.and.arrow.up")
-          }
-
-          Button {
-            pin()
-          } label: {
-            Label(localized("common.pin"), systemImage: "pin")
-          }
+        ViewThatFits(in: .horizontal) {
+          HStack(spacing: 10) { reviewActions }.fixedSize(horizontal: true, vertical: false)
+          VStack(spacing: 8) { reviewActions }
         }
         .buttonStyle(.bordered)
-        .disabled(isBusy || item == nil)
+        .disabled(isBusy || image == nil || item == nil)
       }
       .padding(20)
       .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -840,10 +798,48 @@ private struct CaptureReviewView: View {
       }
     }
     .onAppear(perform: loadImage)
+    .onDisappear { previewRequestID = UUID() }
     .onReceive(settings.objectWillChange) { _ in
       DispatchQueue.main.async {
         renderPreview()
       }
+    }
+  }
+
+  @ViewBuilder
+  private var reviewActions: some View {
+    Button {
+      copy()
+    } label: {
+      Label(localized("common.copy"), systemImage: "doc.on.doc")
+    }
+    .buttonStyle(.borderedProminent)
+    .accessibilityIdentifier("review.copy")
+
+    Button {
+      if let item {
+        store.openEditor(itemID: item.id)
+      }
+    } label: {
+      Label(localized("settings.open_editor"), systemImage: "pencil.and.outline")
+    }
+
+    Button {
+      save()
+    } label: {
+      Label(localized("common.save"), systemImage: "square.and.arrow.down")
+    }
+
+    Button {
+      share()
+    } label: {
+      Label(localized("common.share"), systemImage: "square.and.arrow.up")
+    }
+
+    Button {
+      pin()
+    } label: {
+      Label(localized("common.pin"), systemImage: "pin")
     }
   }
 
@@ -905,8 +901,8 @@ private struct CaptureReviewView: View {
       }
       let pasteboard = NSPasteboard.general
       pasteboard.clearContents()
-      pasteboard.writeObjects([rendered])
-      store.presentStatus(localized("review.copied"), kind: .success)
+      let copied = pasteboard.writeObjects([rendered])
+      store.presentStatus(localized(copied ? "review.copied" : "status.copy_failed"), kind: copied ? .success : .error)
     }
   }
 
@@ -990,6 +986,8 @@ private struct EditorWorkspaceView: View {
   @State private var currentStrokeWidth: CGFloat = 4
   @State private var textInput: String = ""
   @State private var isExporting = false
+  @State private var imageLoadFailed = false
+  @State private var loadRequestID = UUID()
 
   private var item: ShotQueueItem? {
     queue.item(for: itemID)
@@ -1014,6 +1012,16 @@ private struct EditorWorkspaceView: View {
               onAction: recordDraft
             )
             .padding(18)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(localized("common.edit")), \(Int(image.size.width)) × \(Int(image.size.height))")
+            .accessibilityIdentifier("editor.canvas")
+          } else if imageLoadFailed {
+            VStack(spacing: 12) {
+              Text(localized("status.unsupported_image"))
+              Button(localized("common.retry"), action: loadState)
+                .accessibilityIdentifier("editor.retry")
+            }
+            .foregroundStyle(.white)
           } else {
             ProgressView()
           }
@@ -1043,9 +1051,21 @@ private struct EditorWorkspaceView: View {
     .onChange(of: itemID) {
       loadState()
     }
+    .onDisappear { loadRequestID = UUID() }
   }
 
   private var editorToolbar: some View {
+    ViewThatFits(in: .horizontal) {
+      editorToolbarContent.fixedSize(horizontal: true, vertical: false)
+      editorToolbarContent.labelStyle(.iconOnly)
+    }
+    .buttonStyle(.bordered)
+    .disabled(isExporting)
+    .padding(.horizontal, 14)
+    .padding(.vertical, 9)
+  }
+
+  private var editorToolbarContent: some View {
     HStack(spacing: 8) {
       Button {
         store.showSessionOverview()
@@ -1053,6 +1073,7 @@ private struct EditorWorkspaceView: View {
         Label(localized("common.back"), systemImage: "chevron.left")
       }
       .buttonStyle(.bordered)
+      .accessibilityIdentifier("editor.back")
 
       Divider()
         .frame(height: 20)
@@ -1080,34 +1101,40 @@ private struct EditorWorkspaceView: View {
       Button(action: copyFinal) {
         Label(localized("common.copy"), systemImage: "doc.on.doc")
       }
+      .disabled(image == nil)
       Button(action: shareFinal) {
         Label(localized("common.share"), systemImage: "square.and.arrow.up")
       }
+      .disabled(image == nil)
       Button(action: pinFinal) {
         Label(localized("common.pin"), systemImage: "pin")
       }
+      .disabled(image == nil)
       Button(action: saveFinal) {
         Label(localized("common.save"), systemImage: "square.and.arrow.down")
       }
+      .disabled(image == nil)
       .buttonStyle(.borderedProminent)
       .keyboardShortcut("s", modifiers: .command)
       .accessibilityIdentifier("editor.save")
+      .labelStyle(.titleAndIcon)
     }
-    .buttonStyle(.bordered)
-    .disabled(isExporting)
-    .padding(.horizontal, 14)
-    .padding(.vertical, 9)
   }
 
   private func loadState() {
     guard let item else { return }
-    let draft = drafts.draft(for: itemID)
-    annotations = draft.annotations
-    cropRect = draft.cropRect
+    let requestID = UUID()
+    loadRequestID = requestID
+    image = nil
+    imageLoadFailed = false
+    restoreDraft()
     DispatchQueue.global(qos: .userInitiated).async {
       let loaded = loadImageForRendering(path: item.path)
       DispatchQueue.main.async {
+        guard loadRequestID == requestID else { return }
         image = loaded
+        imageLoadFailed = loaded == nil
+        if loaded == nil { store.presentStatus(localized("status.unsupported_image"), kind: .error) }
       }
     }
   }
@@ -1117,31 +1144,30 @@ private struct EditorWorkspaceView: View {
   }
 
   private func undo() {
-    drafts.update(itemID) { draft in
-      guard draft.undoStack.count > 1 else { return }
-      let current = draft.undoStack.removeLast()
-      draft.redoStack.append(current)
-      let previous = draft.undoStack.last ?? []
-      draft.annotations = previous
-      draft.isDirty = true
-      annotations = previous
-    }
+    drafts.undo(itemID)
+    restoreDraft()
   }
 
   private func redo() {
-    drafts.update(itemID) { draft in
-      guard let next = draft.redoStack.popLast() else { return }
-      draft.undoStack.append(next)
-      draft.annotations = next
-      draft.isDirty = true
-      annotations = next
-    }
+    drafts.redo(itemID)
+    restoreDraft()
+  }
+
+  private func restoreDraft() {
+    let draft = drafts.draft(for: itemID)
+    annotations = draft.annotations
+    cropRect = draft.cropRect
   }
 
   private func saveFinal() {
+    let savedItemID = itemID
+    let savedDraft = drafts.draft(for: savedItemID)
     exportFinal(isTemporary: false) { savedPath in
       if savedPath != nil {
-        drafts.markSaved(itemID)
+        if queue.item(for: savedItemID) != nil,
+           drafts.drafts[savedItemID]?.updatedAt == savedDraft.updatedAt {
+          drafts.markSaved(savedItemID)
+        }
         store.presentStatus(localized("editor.saved"), kind: .success)
         store.loadLibrary()
       } else {
@@ -1155,14 +1181,16 @@ private struct EditorWorkspaceView: View {
     isExporting = true
     let annotations = annotations
     let cropRect = cropRect
+    let preset = ExportPreset.preset(for: settings.exportPresetID)
+    let watermark = WatermarkRenderSettings.current()
     DispatchQueue.global(qos: .userInitiated).async {
       let rendered = ExportService.shared.render(
         ExportContext(
           image: image,
           annotations: annotations,
           cropRect: cropRect,
-          preset: ExportPreset.preset(for: SettingsStore.shared.exportPresetID),
-          watermark: WatermarkRenderSettings.current()
+          preset: preset,
+          watermark: watermark
         )
       )
       DispatchQueue.main.async {
@@ -1173,8 +1201,8 @@ private struct EditorWorkspaceView: View {
         }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.writeObjects([rendered])
-        store.presentStatus(localized("review.copied"), kind: .success)
+        let copied = pasteboard.writeObjects([rendered])
+        store.presentStatus(localized(copied ? "review.copied" : "status.copy_failed"), kind: copied ? .success : .error)
       }
     }
   }
@@ -1205,6 +1233,7 @@ private struct EditorWorkspaceView: View {
     let cropRect = cropRect
     let preset = ExportPreset.preset(for: SettingsStore.shared.exportPresetID)
     let template = SettingsStore.shared.filenameTemplate
+    let watermark = WatermarkRenderSettings.current()
     DispatchQueue.global(qos: .userInitiated).async {
       let savedPath = ExportService.shared.save(
         context: ExportContext(
@@ -1212,7 +1241,7 @@ private struct EditorWorkspaceView: View {
           annotations: annotations,
           cropRect: cropRect,
           preset: preset,
-          watermark: WatermarkRenderSettings.current()
+          watermark: watermark
         ),
         isTemporary: isTemporary,
         filenameTemplate: template
@@ -1245,53 +1274,56 @@ private struct EditorControls: View {
   ]
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      Text(localized("editor.tools"))
-        .font(.body.weight(.semibold))
+    ScrollView {
+      VStack(alignment: .leading, spacing: 14) {
+        Text(localized("editor.tools"))
+          .font(.body.weight(.semibold))
 
-      LazyVGrid(columns: [GridItem(.adaptive(minimum: 44, maximum: 54), spacing: 8)], spacing: 8) {
-        ForEach(tools, id: \.1) { tool, key, icon in
-          Button {
-            currentTool = tool
-          } label: {
-            Image(systemName: icon)
-              .frame(width: 34, height: 28)
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 44, maximum: 54), spacing: 8)], spacing: 8) {
+          ForEach(tools, id: \.1) { tool, key, icon in
+            Button {
+              currentTool = tool
+            } label: {
+              Image(systemName: icon)
+                .frame(width: 34, height: 28)
+            }
+            .buttonStyle(.bordered)
+            .help(localized(key))
+            .tint(currentTool == tool ? QPARKDesign.brandCyan : nil)
+            .accessibilityLabel(localized(key))
+            .accessibilityValue(currentTool == tool ? localized("status.selected") : "")
           }
-          .buttonStyle(.bordered)
-          .help(localized(key))
-          .tint(currentTool == tool ? QPARKDesign.brandCyan : nil)
-          .accessibilityLabel(localized(key))
-          .accessibilityValue(currentTool == tool ? localized("status.selected") : "")
         }
+
+        ColorPicker(localized("editor.color"), selection: $currentColor)
+
+        VStack(alignment: .leading) {
+          Text(localized("editor.stroke"))
+            .font(.caption)
+            .foregroundColor(.secondary)
+          Slider(value: Binding(
+            get: { Double(currentStrokeWidth) },
+            set: { currentStrokeWidth = CGFloat($0) }
+          ), in: 1...18, step: 1)
+          .accessibilityLabel(localized("editor.stroke"))
+          .accessibilityValue("\(Int(currentStrokeWidth)) pt")
+        }
+
+        TextField(localized("editor.text_placeholder"), text: $textInput)
+          .textFieldStyle(.roundedBorder)
+
+        Button {
+          onClearCrop()
+        } label: {
+          Label(localized("editor.clear_crop"), systemImage: "crop")
+        }
+        .disabled(!hasCrop)
+        .accessibilityIdentifier("editor.clearCrop")
+
+        Spacer()
       }
-
-      ColorPicker(localized("editor.color"), selection: $currentColor)
-
-      VStack(alignment: .leading) {
-        Text(localized("editor.stroke"))
-          .font(.caption)
-          .foregroundColor(.secondary)
-        Slider(value: Binding(
-          get: { Double(currentStrokeWidth) },
-          set: { currentStrokeWidth = CGFloat($0) }
-        ), in: 1...18, step: 1)
-        .accessibilityLabel(localized("editor.stroke"))
-        .accessibilityValue("\(Int(currentStrokeWidth)) pt")
-      }
-
-      TextField(localized("editor.text_placeholder"), text: $textInput)
-        .textFieldStyle(.roundedBorder)
-
-      Button {
-        onClearCrop()
-      } label: {
-        Label(localized("editor.clear_crop"), systemImage: "crop")
-      }
-      .disabled(!hasCrop)
-
-      Spacer()
+      .padding(14)
     }
-    .padding(14)
     .background(Color.primary.opacity(0.04))
   }
 }
@@ -1345,6 +1377,7 @@ private struct ShotQueueThumbnail: View {
     }
     .buttonStyle(.plain)
     .onAppear(perform: loadThumbnail)
+    .accessibilityIdentifier("session.item.\(URL(fileURLWithPath: item.path).lastPathComponent)")
   }
 
   private func loadThumbnail() {
@@ -1365,24 +1398,26 @@ private struct WorkspaceInspector: View {
   @State private var tagsText = ""
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      Text(localized("workspace.inspector"))
-        .font(.body.weight(.semibold))
+    ScrollView {
+      VStack(alignment: .leading, spacing: 14) {
+        Text(localized("workspace.inspector"))
+          .font(.body.weight(.semibold))
 
-      if store.selectedSection == .currentSession {
-        sessionInspector
-      } else if store.selectedSection == .missing, let shot = store.selectedMissingShot {
-        missingInspector(shot)
-      } else if let shot = store.selectedShot {
-        libraryInspector(shot)
-      } else {
-        Text(localized("workspace.no_selection"))
-          .font(.caption)
-          .foregroundColor(.secondary)
+        if store.selectedSection == .currentSession {
+          sessionInspector
+        } else if store.selectedSection == .missing, let shot = store.selectedMissingShot {
+          missingInspector(shot)
+        } else if let shot = store.selectedShot {
+          libraryInspector(shot)
+        } else {
+          Text(localized("workspace.no_selection"))
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        Spacer()
       }
-      Spacer()
+      .padding(14)
     }
-    .padding(14)
     .onAppear(perform: refreshTagsText)
     .onChange(of: store.selectedLibraryPath) {
       refreshTagsText()
@@ -1488,6 +1523,9 @@ private struct WorkspaceInspector: View {
       Text(localized("status.ocr_disabled"))
         .font(.caption2)
         .foregroundColor(.secondary)
+    } else if store.failedOCRPaths.contains(path) {
+      Button(localized("common.retry")) { store.loadLibrary() }
+        .accessibilityIdentifier("ocr.retry")
     } else if store.isOCRRunning(for: path) || entry.ocrIndexedAt == nil {
       Label(localized("status.indexing"), systemImage: "text.viewfinder")
         .font(.caption2)

@@ -203,6 +203,8 @@ final class LocalizationController: ObservableObject {
       "menu.capture": row("Capture", "Capturar", "截图", "キャプチャ", "Capture", "Снимок", "Знімок", "Түсіру", "التقاط", "Aufnehmen", "Acquisisci", "Capturar"),
       "menu.view": row("View", "Vista", "视图", "表示", "Présentation", "Вид", "Вигляд", "Көрініс", "عرض", "Darstellung", "Vista", "Visualizar"),
       "menu.tools": row("Tools", "Herramientas", "工具", "ツール", "Outils", "Инструменты", "Інструменти", "Құралдар", "الأدوات", "Werkzeuge", "Strumenti", "Ferramentas"),
+      "settings.about": row("About", "Acerca de", "关于", "このアプリについて", "À propos", "О приложении", "Про застосунок", "Қолданба туралы", "حول التطبيق", "Über die App", "Informazioni", "Sobre"),
+      "settings.version": row("Version", "Versión", "版本", "バージョン", "Version", "Версия", "Версія", "Нұсқа", "الإصدار", "Version", "Versione", "Versão"),
       "menu.about": row("About QPARK Shot", "Acerca de QPARK Shot", "关于 QPARK Shot", "QPARK Shot について", "À propos de QPARK Shot", "О QPARK Shot", "Про QPARK Shot", "QPARK Shot туралы", "حول QPARK Shot", "Über QPARK Shot", "Informazioni su QPARK Shot", "Sobre o QPARK Shot"),
       "menu.hide": row("Hide QPARK Shot", "Ocultar QPARK Shot", "隐藏 QPARK Shot", "QPARK Shot を非表示", "Masquer QPARK Shot", "Скрыть QPARK Shot", "Сховати QPARK Shot", "QPARK Shot жасыру", "إخفاء QPARK Shot", "QPARK Shot ausblenden", "Nascondi QPARK Shot", "Ocultar QPARK Shot"),
       "menu.edit": row("Edit", "Edición", "编辑", "編集", "Édition", "Правка", "Редагування", "Өңдеу", "تحرير", "Bearbeiten", "Modifica", "Editar"),

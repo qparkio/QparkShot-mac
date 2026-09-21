@@ -6,14 +6,27 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate {
   static let shared = PreferencesWindowController()
 
   private var window: NSWindow?
+  private let navigation = PreferencesNavigation()
 
   private override init() {}
 
-  func show() {
+  func show(about: Bool = false) {
+    let mainWindow = NSApp.windows.first { $0.identifier == MainAppWindow.mainWindowIdentifier }
+    if about { navigation.selectedPane = .about }
+    let wasVisible = self.window?.isVisible == true
     let window = self.window ?? makeWindow()
     self.window = window
     window.title = localized("common.settings")
     window.makeKeyAndOrderFront(nil)
+    if !wasVisible, let mainWindow {
+      window.contentView?.layoutSubtreeIfNeeded()
+      let visible = mainWindow.screen?.visibleFrame ?? mainWindow.frame
+      let origin = NSPoint(
+        x: min(max(mainWindow.frame.midX - window.frame.width / 2, visible.minX), max(visible.minX, visible.maxX - window.frame.width)),
+        y: min(max(mainWindow.frame.midY - window.frame.height / 2, visible.minY), max(visible.minY, visible.maxY - window.frame.height))
+      )
+      window.setFrameOrigin(origin)
+    }
     NSApp.activate(ignoringOtherApps: true)
   }
 
@@ -26,15 +39,22 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate {
   }
 
   private func makeWindow() -> NSWindow {
-    let root = PreferencesRootView()
+    let root = PreferencesRootView(navigation: navigation)
     let controller = NSHostingController(rootView: root)
+    controller.sizingOptions = []
     let window = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 900, height: 680),
+      contentRect: NSRect(x: 0, y: 0, width: 1000, height: 720),
       styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered,
       defer: false
     )
+    let initialFrame = window.frame
     window.contentViewController = controller
+    window.setFrame(initialFrame, display: false)
+    window.contentMinSize = NSSize(width: 780, height: 580)
+    if AppTestEnvironment.value("QPARK_TEST_SETTINGS_MIN") == "1" {
+      window.setContentSize(NSSize(width: 780, height: 580))
+    }
     window.isReleasedWhenClosed = false
     window.delegate = self
     window.center()
@@ -48,6 +68,7 @@ private enum PreferencesPane: String, CaseIterable, Identifiable {
   case export
   case watermark
   case storage
+  case about
 
   var id: String { rawValue }
 
@@ -57,6 +78,7 @@ private enum PreferencesPane: String, CaseIterable, Identifiable {
     case .capture: return "settings.capture"
     case .export: return "settings.export"
     case .watermark: return "settings.watermark"
+    case .about: return "settings.about"
     case .storage: return "settings.storage"
     }
   }
@@ -67,6 +89,7 @@ private enum PreferencesPane: String, CaseIterable, Identifiable {
     case .capture: return "settings.subtitle.capture"
     case .export: return "settings.subtitle.export"
     case .watermark: return "settings.subtitle.watermark"
+    case .about: return "app.name"
     case .storage: return "settings.subtitle.storage"
     }
   }
@@ -77,6 +100,7 @@ private enum PreferencesPane: String, CaseIterable, Identifiable {
     case .capture: return "camera.viewfinder"
     case .export: return "square.and.arrow.down.fill"
     case .watermark: return "seal.fill"
+    case .about: return "info.circle.fill"
     case .storage: return "folder.fill"
     }
   }
@@ -87,19 +111,25 @@ private enum PreferencesPane: String, CaseIterable, Identifiable {
     case .capture: return .blue
     case .export: return .green
     case .watermark: return .orange
+    case .about: return .blue
     case .storage: return .purple
     }
   }
 }
 
+private final class PreferencesNavigation: ObservableObject {
+  @Published var selectedPane: PreferencesPane = .general
+}
+
 private struct PreferencesRootView: View {
   @ObservedObject private var store = SettingsStore.shared
   @ObservedObject private var localization = LocalizationController.shared
-  @State private var selectedPane: PreferencesPane = .general
+  @ObservedObject var navigation: PreferencesNavigation
+  private var selectedPane: PreferencesPane { navigation.selectedPane }
 
   var body: some View {
     NavigationSplitView {
-      PreferencesSidebar(selectedPane: $selectedPane)
+      PreferencesSidebar(selectedPane: $navigation.selectedPane)
         .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 250)
     } detail: {
       ScrollView {
@@ -108,13 +138,12 @@ private struct PreferencesRootView: View {
           selectedContent
         }
         .padding(20)
-        .frame(maxWidth: 680)
+        .frame(maxWidth: 820)
         .frame(maxWidth: .infinity, alignment: .top)
       }
       .navigationTitle(localized(selectedPane.titleKey))
     }
     .frame(minWidth: 780, minHeight: 580)
-    .preferredColorScheme(store.preferredColorScheme)
     .environment(\.locale, localization.locale)
     .environment(\.layoutDirection, localization.layoutDirection)
   }
@@ -132,6 +161,27 @@ private struct PreferencesRootView: View {
       watermark
     case .storage:
       storage
+    case .about:
+      about
+    }
+  }
+
+  private var about: some View {
+    SettingsCard {
+      VStack(spacing: 16) {
+        Image(nsImage: NSApplication.shared.applicationIconImage)
+          .resizable()
+          .frame(width: 80, height: 80)
+        Text(localized("app.name")).font(.title.bold())
+        Text("\(localized("settings.version")) \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"))")
+          .foregroundStyle(.secondary)
+        Text(Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String ?? "© 2026 QPARK")
+        Link("qpark.io", destination: URL(string: "https://qpark.io")!)
+        Link("work@qpark.io", destination: URL(string: "mailto:work@qpark.io")!)
+      }
+      .frame(maxWidth: .infinity)
+      .padding(24)
+      .textSelection(.enabled)
     }
   }
 
@@ -480,7 +530,7 @@ private struct PreferencesRootView: View {
             .foregroundColor(.secondary)
             .lineLimit(1)
             .truncationMode(.middle)
-            .frame(width: 210, alignment: .trailing)
+            .frame(maxWidth: 210, alignment: .trailing)
           Button(localized("settings.choose_folder"), action: chooseFolder)
           Button(localized("common.clear")) {
             store.saveDirectory = ""
@@ -610,6 +660,9 @@ private struct PreferencesRootView: View {
 
   private func cleanupDurationLabel(hours: Double) -> String {
     let formatter = DateComponentsFormatter()
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.locale = localization.locale
+    formatter.calendar = calendar
     formatter.unitsStyle = .full
     formatter.maximumUnitCount = 1
     formatter.allowedUnits = hours >= 24 ? [.day] : [.hour]
@@ -725,14 +778,23 @@ private struct SettingsRow<Control: View>: View {
     self.control = control()
   }
 
+  private var title: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(localized(titleKey)).font(.body.weight(.medium))
+      if let subtitleKey { Text(localized(subtitleKey)).font(.caption).foregroundColor(.secondary) }
+    }
+  }
+
   var body: some View {
-    LabeledContent {
-      control
-        .frame(minWidth: 44, alignment: .trailing)
-    } label: {
-      VStack(alignment: .leading, spacing: 3) {
-        Text(localized(titleKey)).font(.body.weight(.medium))
-        if let subtitleKey { Text(localized(subtitleKey)).font(.caption).foregroundColor(.secondary) }
+    ViewThatFits(in: .horizontal) {
+      HStack(spacing: 12) {
+        title.fixedSize(horizontal: true, vertical: false)
+        Spacer(minLength: 12)
+        control
+      }
+      VStack(alignment: .leading, spacing: 8) {
+        title
+        control
       }
     }
     .padding(.horizontal, 14)
@@ -876,13 +938,13 @@ private func makeWatermarkPreviewBaseImage() -> NSImage {
 private struct PreferencesSurfacePreviews: PreviewProvider {
   static var previews: some View {
     Group {
-      PreferencesRootView()
+      PreferencesRootView(navigation: PreferencesNavigation())
         .frame(width: 920, height: 620)
         .preferredColorScheme(.light)
         .environment(\.locale, AppLanguage.german.locale)
         .previewDisplayName("Settings · DE · Light · 920×620")
 
-      PreferencesRootView()
+      PreferencesRootView(navigation: PreferencesNavigation())
         .frame(width: 1280, height: 800)
         .preferredColorScheme(.dark)
         .environment(\.locale, AppLanguage.arabic.locale)

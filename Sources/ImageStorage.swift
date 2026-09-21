@@ -2,9 +2,10 @@ import Cocoa
 import ImageIO
 
 func makeThumbnailImage(path: String, maxPixelSize: CGFloat) -> NSImage? {
-  let access = securityScopedAccess(
+  let access = securityScopedImageAccess(
     url: URL(fileURLWithPath: path),
-    bookmarkData: GalleryIndexStore.shared.bookmarkData(for: path)
+    bookmarkData: GalleryIndexStore.shared.bookmarkData(for: path),
+    folders: storageFolderCandidates(isTemporary: false)
   )
   defer { access.stop() }
   let url = access.url as CFURL
@@ -33,9 +34,10 @@ func makeThumbnailImage(path: String, maxPixelSize: CGFloat) -> NSImage? {
 }
 
 func loadImageForRendering(path: String) -> NSImage? {
-  let access = securityScopedAccess(
+  let access = securityScopedImageAccess(
     url: URL(fileURLWithPath: path),
-    bookmarkData: GalleryIndexStore.shared.bookmarkData(for: path)
+    bookmarkData: GalleryIndexStore.shared.bookmarkData(for: path),
+    folders: storageFolderCandidates(isTemporary: false)
   )
   defer { access.stop() }
   let url = access.url as CFURL

@@ -2,6 +2,7 @@ import Foundation
 
 actor CleanupService {
   typealias TrashOperation = @Sendable (URL) throws -> Void
+  typealias MutationGuard = @MainActor @Sendable (URL, Bool) -> Bool
 
   static let shared = CleanupService()
 
@@ -28,8 +29,9 @@ actor CleanupService {
     activePaths: Set<String>,
     temporaryRoots: [URL],
     savedRoots: [StorageFolderCandidate],
-    now: Date = Date()
-  ) -> CleanupReport {
+    now: Date = Date(),
+    allowsMutation: MutationGuard? = nil
+  ) async -> CleanupReport {
     guard policy.mode == .afterDuration else { return CleanupReport() }
 
     let cutoff = now.addingTimeInterval(-max(policy.maxAge, 60))
@@ -37,20 +39,22 @@ actor CleanupService {
     var report = CleanupReport()
 
     for root in temporaryRoots {
-      cleanTemporaryRoot(
+      await cleanTemporaryRoot(
         root,
         cutoff: cutoff,
         activeCanonicalPaths: activeCanonicalPaths,
+        allowsMutation: allowsMutation,
         report: &report
       )
     }
 
     if policy.includeSavedFiles {
-      cleanSavedFiles(
+      await cleanSavedFiles(
         galleryEntries,
         roots: savedRoots,
         cutoff: cutoff,
         activeCanonicalPaths: activeCanonicalPaths,
+        allowsMutation: allowsMutation,
         report: &report
       )
     }
@@ -62,8 +66,9 @@ actor CleanupService {
     _ root: URL,
     cutoff: Date,
     activeCanonicalPaths: Set<String>,
+    allowsMutation: MutationGuard?,
     report: inout CleanupReport
-  ) {
+  ) async {
     let canonicalRoot = canonicalPath(root)
     guard fileManager.fileExists(atPath: canonicalRoot) else { return }
 
@@ -80,7 +85,7 @@ actor CleanupService {
       return
     }
 
-    for case let fileURL as URL in enumerator {
+    while let fileURL = enumerator.nextObject() as? URL {
       let canonicalFile = canonicalPath(fileURL)
       guard isDescendant(canonicalFile, of: canonicalRoot),
             !activeCanonicalPaths.contains(canonicalFile),
@@ -98,8 +103,13 @@ actor CleanupService {
         activeCanonicalPaths: activeCanonicalPaths
       ) else { continue }
       do {
-        try fileManager.removeItem(at: fileURL)
-        report.deletedTemporaryPaths.append(fileURL.path)
+        let removed = try await MainActor.run {
+          guard allowsMutation?(fileURL, false) ?? true,
+                self.isSafeTemporaryCandidate(fileURL, root: canonicalRoot, cutoff: cutoff, activeCanonicalPaths: activeCanonicalPaths) else { return false }
+          try FileManager.default.removeItem(at: fileURL)
+          return true
+        }
+        if removed { report.deletedTemporaryPaths.append(fileURL.path) }
       } catch {
         report.failures.append(fileURL.path)
       }
@@ -111,8 +121,9 @@ actor CleanupService {
     roots: [StorageFolderCandidate],
     cutoff: Date,
     activeCanonicalPaths: Set<String>,
+    allowsMutation: MutationGuard?,
     report: inout CleanupReport
-  ) {
+  ) async {
     let accesses = roots.map {
       securityScopedAccess(url: $0.url, bookmarkData: $0.bookmarkData)
     }
@@ -136,15 +147,21 @@ actor CleanupService {
         activeCanonicalPaths: activeCanonicalPaths
       ) else { continue }
       do {
-        try trashOperation(fileURL)
-        report.trashedSavedPaths.append(entry.path)
+        let trash = trashOperation
+        let removed = try await MainActor.run {
+          guard allowsMutation?(fileURL, true) ?? true,
+                self.isSafeSavedCandidate(fileURL, roots: canonicalRoots, cutoff: cutoff, activeCanonicalPaths: activeCanonicalPaths) else { return false }
+          try trash(fileURL)
+          return true
+        }
+        if removed { report.trashedSavedPaths.append(entry.path) }
       } catch {
         report.failures.append(entry.path)
       }
     }
   }
 
-  private func isOldRegularFile(_ url: URL, cutoff: Date) -> Bool {
+  nonisolated private func isOldRegularFile(_ url: URL, cutoff: Date) -> Bool {
     // Recreate the URL so resource values cached by FileManager's enumerator
     // cannot hide a concurrent writer's latest modification date.
     let freshURL = URL(fileURLWithPath: url.path)
@@ -160,7 +177,7 @@ actor CleanupService {
     return date < cutoff
   }
 
-  private func isSafeTemporaryCandidate(
+  nonisolated private func isSafeTemporaryCandidate(
     _ url: URL,
     root: String,
     cutoff: Date,
@@ -172,7 +189,7 @@ actor CleanupService {
       && isOldRegularFile(url, cutoff: cutoff)
   }
 
-  private func isSafeSavedCandidate(
+  nonisolated private func isSafeSavedCandidate(
     _ url: URL,
     roots: [String],
     cutoff: Date,
@@ -184,15 +201,15 @@ actor CleanupService {
       && isOldRegularFile(url, cutoff: cutoff)
   }
 
-  private func canonicalPath(_ url: URL) -> String {
+  nonisolated private func canonicalPath(_ url: URL) -> String {
     url.standardizedFileURL.resolvingSymlinksInPath().path
   }
 
-  private func canonicalPath(_ path: String) -> String {
+  nonisolated private func canonicalPath(_ path: String) -> String {
     canonicalPath(URL(fileURLWithPath: path))
   }
 
-  private func isDescendant(_ path: String, of root: String) -> Bool {
+  nonisolated private func isDescendant(_ path: String, of root: String) -> Bool {
     path == root || path.hasPrefix(root + "/")
   }
 }

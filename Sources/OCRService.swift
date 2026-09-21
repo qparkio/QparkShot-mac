@@ -4,7 +4,9 @@ import Vision
 
 final class OCRService {
   static let shared = OCRService()
-  static let indexVersion = 2
+  static let indexVersion = 3
+
+  private let recognitionQueue = DispatchQueue(label: "com.qpark.shot.ocr", qos: .utility)
 
   private init() {}
 
@@ -24,7 +26,7 @@ final class OCRService {
   }
 
   func recognizeText(in path: String, completion: @escaping (String) -> Void) {
-    DispatchQueue.global(qos: .utility).async {
+    recognitionQueue.async {
       let text = Self.recognizeTextSynchronously(in: path)
       DispatchQueue.main.async {
         completion(text)
@@ -32,15 +34,20 @@ final class OCRService {
     }
   }
 
-  func recognize(in path: String, completion: @escaping (OCRResult) -> Void) {
-    let languages = Self.visionRecognitionLanguages(
-      for: SettingsStore.shared.textRecognitionLanguageCodes
-    )
-
-    DispatchQueue.global(qos: .utility).async {
-      let result = Self.recognizeSynchronously(in: path, recognitionLanguages: languages)
-      DispatchQueue.main.async {
-        completion(result)
+  func recognize(
+    in path: String,
+    recognitionLanguages: [String],
+    bookmarkData: Data?,
+    folders: [StorageFolderCandidate],
+    expectedModifiedAt: Date?
+  ) async -> OCRResult {
+    await withCheckedContinuation { continuation in
+      recognitionQueue.async {
+        let access = securityScopedImageAccess(url: URL(fileURLWithPath: path), bookmarkData: bookmarkData, folders: folders)
+        defer { access.stop() }
+        let result = Self.recognizeSynchronously(in: access.url.path, recognitionLanguages: recognitionLanguages)
+        let modifiedAt = try? URL(fileURLWithPath: access.url.path).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        continuation.resume(returning: modifiedAt == expectedModifiedAt ? result : .failed("source-changed"))
       }
     }
   }
@@ -103,5 +110,39 @@ final class OCRService {
     let request = VNRecognizeTextRequest()
     let languages = (try? request.supportedRecognitionLanguages()) ?? ["en-US"]
     return Set(languages)
+  }
+}
+
+/// Serial recognition bounds image memory; replacing a run invalidates its late results.
+@MainActor
+final class OCRIndexingQueue {
+  private var task: Task<Void, Never>?
+
+  func cancel() {
+    task?.cancel()
+    task = nil
+  }
+
+  func start(
+    paths: [String],
+    recognize: @escaping (String) async -> OCRService.OCRResult,
+    started: @escaping (String) -> Void,
+    completed: @escaping (String, OCRService.OCRResult) -> Void
+  ) {
+    cancel()
+    task = Task {
+      for path in paths {
+        guard !Task.isCancelled else { return }
+        started(path)
+        var result = await recognize(path)
+        guard !Task.isCancelled else { return }
+        if case .failed = result {
+          // One retry per pass; persistent errors remain eligible on the next reload.
+          result = await recognize(path)
+        }
+        guard !Task.isCancelled else { return }
+        completed(path, result)
+      }
+    }
   }
 }

@@ -88,19 +88,23 @@ struct LibraryShot: Identifiable, Equatable {
 final class WorkspaceStore: ObservableObject {
   static let shared = WorkspaceStore()
 
-  @Published var selectedSection: WorkspaceSection = .library
+  @Published var selectedSection: WorkspaceSection = .library {
+    didSet { if selectedSection != oldValue { reconcileSelection() } }
+  }
   @Published var mode: WorkspaceMode = .library
   @Published var libraryShots: [LibraryShot] = []
   @Published var missingShots: [GalleryIndexEntry] = []
   @Published var selectedLibraryPath: String? = nil
-  @Published var searchText: String = ""
+  @Published var searchText: String = "" { didSet { reconcileSelection() } }
   @Published var isInspectorVisible: Bool = true
   @Published var status: WorkspaceStatus? = nil
   @Published var isBusy: Bool = false
   @Published var isCapturing: Bool = false
   @Published private(set) var runningOCRPaths: Set<String> = []
+  @Published private(set) var failedOCRPaths: Set<String> = []
 
   private var loadRequestID = UUID()
+  private let ocrQueue = OCRIndexingQueue()
   private var statusDismissTask: Task<Void, Never>?
   private let fileManager = FileManager.default
   private let galleryIndex = GalleryIndexStore.shared
@@ -150,12 +154,20 @@ final class WorkspaceStore: ObservableObject {
 
   var selectedShot: LibraryShot? {
     guard let selectedLibraryPath else { return displayedLibraryShots.first }
-    return libraryShots.first { $0.path == selectedLibraryPath }
+    return displayedLibraryShots.first { $0.path == selectedLibraryPath } ?? displayedLibraryShots.first
   }
 
   var selectedMissingShot: GalleryIndexEntry? {
     guard let selectedLibraryPath else { return displayedMissingShots.first }
-    return missingShots.first { $0.path == selectedLibraryPath }
+    return displayedMissingShots.first { $0.path == selectedLibraryPath } ?? displayedMissingShots.first
+  }
+
+  private func reconcileSelection() {
+    let paths = selectedSection == .missing
+      ? displayedMissingShots.map(\.path) : displayedLibraryShots.map(\.path)
+    if selectedLibraryPath == nil || !paths.contains(selectedLibraryPath!) {
+      selectedLibraryPath = paths.first
+    }
   }
 
   var cleanupActivePaths: Set<String> {
@@ -176,6 +188,7 @@ final class WorkspaceStore: ObservableObject {
           arguments.indices.contains(flagIndex + 1) else { return false }
 
     let scenario = arguments[flagIndex + 1]
+    loadRequestID = UUID()
     status = nil
     isBusy = false
     searchText = ""
@@ -187,6 +200,13 @@ final class WorkspaceStore: ObservableObject {
       mode = .permissionRequired
     case "error":
       mode = .error(localized("status.capture_failed"))
+    case "broken-editor":
+      let item = ShotQueueStore.shared.enqueue(path: storageFolderURL(isTemporary: false).appendingPathComponent("missing.png").path)
+      openEditor(itemID: item.id)
+    case "multi-editor":
+      let first = ShotQueueStore.shared.enqueue(path: Self.makeUITestImage().path)
+      _ = ShotQueueStore.shared.enqueue(path: Self.makeUITestImage(name: "Portrait.png", size: NSSize(width: 300, height: 600)).path)
+      openEditor(itemID: first.id)
     case "review", "editor":
       let item = ShotQueueStore.shared.enqueue(path: Self.makeUITestImage().path)
       selectedSection = .currentSession
@@ -194,7 +214,7 @@ final class WorkspaceStore: ObservableObject {
         mode = .captureReview(item.id)
       } else {
         mode = .editor(item.id)
-        EditorDraftStore.shared.recordAnnotations([], cropRect: CGRect(x: 0, y: 0, width: 0.8, height: 0.8), for: item.id)
+        EditorDraftStore.shared.recordAnnotations([], cropRect: CGRect(x: 0, y: 0, width: 512, height: 288), for: item.id)
       }
     default:
       let url = Self.makeUITestImage()
@@ -214,15 +234,17 @@ final class WorkspaceStore: ObservableObject {
     return true
   }
 
-  private static func makeUITestImage() -> URL {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("QPARK UI Test.png")
+  private static func makeUITestImage(name: String = "QPARK UI Test.png", size: NSSize = NSSize(width: 640, height: 360)) -> URL {
+    let folder = storageFolderURL(isTemporary: false)
+    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let url = folder.appendingPathComponent(name)
     guard !FileManager.default.fileExists(atPath: url.path) else { return url }
-    let image = NSImage(size: NSSize(width: 640, height: 360))
+    let image = NSImage(size: size)
     image.lockFocus()
     NSColor.windowBackgroundColor.setFill()
-    NSRect(x: 0, y: 0, width: 640, height: 360).fill()
+    NSRect(origin: .zero, size: size).fill()
     NSColor.systemCyan.setFill()
-    NSBezierPath(roundedRect: NSRect(x: 64, y: 80, width: 512, height: 200), xRadius: 24, yRadius: 24).fill()
+    NSBezierPath(roundedRect: NSRect(x: size.width * 0.1, y: size.height * 0.2, width: size.width * 0.8, height: size.height * 0.6), xRadius: 24, yRadius: 24).fill()
     image.unlockFocus()
     if let data = ExportService.shared.pngData(from: image) {
       try? data.write(to: url, options: .atomic)
@@ -335,9 +357,10 @@ final class WorkspaceStore: ObservableObject {
   func moveLibraryShotToTrash(path: String) {
     let url = URL(fileURLWithPath: path)
     let bookmarkData = galleryIndex.bookmarkData(for: path)
+    let folders = storageFolderCandidates(isTemporary: false)
     isBusy = true
     DispatchQueue.global(qos: .userInitiated).async {
-      let access = securityScopedAccess(url: url, bookmarkData: bookmarkData)
+      let access = securityScopedImageAccess(url: url, bookmarkData: bookmarkData, folders: folders)
       defer { access.stop() }
       do {
         var resultURL: NSURL?
@@ -404,6 +427,9 @@ final class WorkspaceStore: ObservableObject {
   }
 
   func loadLibrary() {
+    ocrQueue.cancel()
+    runningOCRPaths.removeAll()
+    failedOCRPaths.removeAll()
     let requestID = UUID()
     loadRequestID = requestID
     let saveDirectory = SettingsStore.shared.saveDirectory
@@ -434,7 +460,11 @@ final class WorkspaceStore: ObservableObject {
         for url in contents where Self.isSupportedImage(url) {
           let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
           let date = values?.creationDate ?? values?.contentModificationDate ?? .distantPast
-          snapshotsByPath[url.path] = GalleryFileSnapshot(path: url.path, createdAt: date)
+          var snapshot = GalleryFileSnapshot(path: url.path, createdAt: date, modifiedAt: values?.contentModificationDate)
+          if folderCandidate.bookmarkData != nil {
+            snapshot.securityBookmarkData = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+          }
+          snapshotsByPath[url.path] = snapshot
         }
       }
 
@@ -452,7 +482,7 @@ final class WorkspaceStore: ObservableObject {
           ?? values?.contentModificationDate
           ?? entry.lastKnownCreatedAt
           ?? .distantPast
-        snapshotsByPath[access.url.path] = GalleryFileSnapshot(path: access.url.path, createdAt: date)
+        snapshotsByPath[access.url.path] = GalleryFileSnapshot(path: access.url.path, createdAt: date, modifiedAt: values?.contentModificationDate)
       }
 
       let snapshots = snapshotsByPath.values.sorted { $0.createdAt > $1.createdAt }
@@ -476,8 +506,9 @@ final class WorkspaceStore: ObservableObject {
             ? self.missingShots.first?.path
             : self.displayedLibraryShots.first?.path
         }
+        self.reconcileSelection()
         self.isBusy = false
-        self.scheduleOCR(for: snapshots.map(\.path))
+        self.scheduleOCR(for: snapshots)
       }
     }
   }
@@ -493,15 +524,19 @@ final class WorkspaceStore: ObservableObject {
         }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.writeObjects([image])
-        self.presentStatus(localized("review.copied"), kind: .success)
-        completion?(true)
+        let copied = pasteboard.writeObjects([image])
+        self.presentStatus(localized(copied ? "review.copied" : "status.copy_failed"), kind: copied ? .success : .error)
+        completion?(copied)
       }
     }
   }
 
   func share(path: String) {
-    let picker = NSSharingServicePicker(items: [URL(fileURLWithPath: path)])
+    guard let image = loadImageForRendering(path: path) else {
+      presentStatus(localized("status.unsupported_image"), kind: .error)
+      return
+    }
+    let picker = NSSharingServicePicker(items: [image])
     if let window = NSApp.keyWindow, let contentView = window.contentView {
       let rect = NSRect(x: contentView.bounds.midX, y: contentView.bounds.midY, width: 1, height: 1)
       picker.show(relativeTo: rect, of: contentView, preferredEdge: .minY)
@@ -509,8 +544,8 @@ final class WorkspaceStore: ObservableObject {
   }
 
   func pin(path: String) {
-    PinnedShotWindowController.shared.pinImage(at: path)
-    presentStatus(localized("review.pinned"), kind: .success)
+    let pinned = PinnedShotWindowController.shared.pinImage(at: path)
+    presentStatus(localized(pinned ? "review.pinned" : "status.unsupported_image"), kind: pinned ? .success : .error)
   }
 
   static func galleryFolderURL(saveDirectory: String, fileManager: FileManager = .default) -> URL {
@@ -547,42 +582,43 @@ final class WorkspaceStore: ObservableObject {
       )
     }
     missingShots = galleryIndex.missingEntries
+    reconcileSelection()
   }
 
-  private func scheduleOCR(for paths: [String]) {
+  private func scheduleOCR(for snapshots: [GalleryFileSnapshot]) {
     guard SettingsStore.shared.galleryOCREnabled else { return }
-    let languageSignature = OCRService.languageSignature(
-      for: SettingsStore.shared.textRecognitionLanguageCodes
-    )
-    for path in paths.prefix(40) {
+    let languages = OCRService.visionRecognitionLanguages(for: SettingsStore.shared.textRecognitionLanguageCodes)
+    let signature = languages.joined(separator: ",")
+    let entries = galleryIndex.entries
+    let folders = storageFolderCandidates(isTemporary: false)
+    let versions = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.path, $0.modifiedAt) })
+    let pending = snapshots.map(\.path).filter { path in
       let value = galleryIndex.entry(for: path)
-      let needsOCR = value.ocrIndexedAt == nil
-        || value.ocrLanguageSignature != languageSignature
-        || value.ocrEngineVersion != OCRService.indexVersion
-      guard needsOCR, !runningOCRPaths.contains(path) else { continue }
-      runningOCRPaths.insert(path)
-      OCRService.shared.recognize(in: path) { result in
-        self.runningOCRPaths.remove(path)
-        guard self.libraryShots.contains(where: { $0.path == path }) else { return }
-        switch result {
-        case .succeeded(let text):
-          self.galleryIndex.updateOCRText(
-            text,
-            for: path,
-            languageSignature: languageSignature,
-            engineVersion: OCRService.indexVersion
-          )
-        case .noText, .failed:
-          self.galleryIndex.updateOCRText(
-            "",
-            for: path,
-            languageSignature: languageSignature,
-            engineVersion: OCRService.indexVersion
-          )
-        }
-        self.refreshIndexBackedState()
-      }
+      return value.needsOCR(languageSignature: signature, modifiedAt: versions[path] ?? nil)
     }
+    ocrQueue.start(paths: pending, recognize: { path in
+      await OCRService.shared.recognize(
+        in: path, recognitionLanguages: languages, bookmarkData: entries[path]?.securityBookmarkData, folders: folders, expectedModifiedAt: versions[path] ?? nil
+      )
+    }, started: { [weak self] path in
+      self?.runningOCRPaths.insert(path)
+    }, completed: { [weak self] path, result in
+      guard let self else { return }
+      self.runningOCRPaths.remove(path)
+      guard SettingsStore.shared.galleryOCREnabled,
+            self.libraryShots.contains(where: { $0.path == path }),
+            OCRService.languageSignature(for: SettingsStore.shared.textRecognitionLanguageCodes) == signature else { return }
+      switch result {
+      case .succeeded(let text):
+        self.galleryIndex.updateOCRText(text, for: path, languageSignature: signature, engineVersion: OCRService.indexVersion, sourceModifiedAt: versions[path] ?? nil)
+      case .noText:
+        self.galleryIndex.updateOCRText("", for: path, languageSignature: signature, engineVersion: OCRService.indexVersion, sourceModifiedAt: versions[path] ?? nil)
+      case .failed:
+        self.failedOCRPaths.insert(path)
+        return
+      }
+      self.refreshIndexBackedState()
+    })
   }
 
   func isOCRRunning(for path: String) -> Bool {

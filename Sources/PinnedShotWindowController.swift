@@ -8,8 +8,9 @@ final class PinnedShotWindowController: NSObject, NSWindowDelegate {
 
   private override init() {}
 
-  func pinImage(at path: String) {
-    guard let image = loadImageForRendering(path: path) else { return }
+  @discardableResult
+  func pinImage(at path: String) -> Bool {
+    guard let image = loadImageForRendering(path: path) else { return false }
 
     let windowBox = WeakWindowBox()
     let content = PinnedShotView(
@@ -47,6 +48,7 @@ final class PinnedShotWindowController: NSObject, NSWindowDelegate {
     windowBox.window = window
 
     windows.append(window)
+    return true
   }
 
   private func close(_ window: NSWindow?) {
@@ -129,7 +131,7 @@ private struct PinnedShotView: View {
 
   private func shareImage() {
     guard let window = NSApp.keyWindow, let contentView = window.contentView else { return }
-    let picker = NSSharingServicePicker(items: [URL(fileURLWithPath: path)])
+    let picker = NSSharingServicePicker(items: [image])
     let rect = NSRect(x: contentView.bounds.midX, y: contentView.bounds.midY, width: 1, height: 1)
     picker.show(relativeTo: rect, of: contentView, preferredEdge: .minY)
   }

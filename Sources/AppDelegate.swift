@@ -33,22 +33,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private var shortcutIDsByCarbonID: [UInt32: String] = [:]
   private var nextHotKeyID: UInt32 = 1
   private var cleanupSchedulerTask: Task<Void, Never>?
+  private var isCleaning = false
   
   func applicationDidFinishLaunching(_ notification: Notification) {
     writeDebugLog("applicationDidFinishLaunching start")
-    SettingsStore.shared.load()
+    _ = SettingsStore.shared
+    if AppTestEnvironment.isEnabled,
+       !ProcessInfo.processInfo.arguments.contains("--ui-test-scenario") { return }
     applyThemePreference()
     setupMainMenu()
     setupStatusItem()
-    syncHotkeySettings()
+    if !AppTestEnvironment.isEnabled { syncHotkeySettings() }
     
     // Show gallery on launch
     showGallery()
-    startCleanupScheduler()
+    if !AppTestEnvironment.isEnabled { startCleanupScheduler() }
     writeDebugLog("applicationDidFinishLaunching end")
   }
   
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard !AppTestEnvironment.isEnabled,
+          ShotQueueStore.shared.temporaryItemCount > 0 || EditorDraftStore.shared.drafts.values.contains(where: \.isDirty) else {
+      return .terminateNow
+    }
+    let alert = NSAlert()
+    alert.messageText = localized("common.quit")
+    alert.informativeText = localized("workspace.clear_session_message")
+    alert.addButton(withTitle: localized("common.quit"))
+    alert.addButton(withTitle: localized("common.cancel"))
+    return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+  }
+
   func applicationWillTerminate(_ notification: Notification) {
+    SettingsStore.shared.flushPendingPersistence()
     cleanupSchedulerTask?.cancel()
     cleanupSchedulerTask = nil
     unregisterAllGlobalShortcuts()
@@ -140,6 +157,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   @MainActor
   private func performCleanup() async {
+    guard !isCleaning else { return }
+    isCleaning = true
+    defer { isCleaning = false }
     let settings = SettingsStore.shared
     let policy = settings.cleanupPolicy
     guard policy.mode == .afterDuration else { return }
@@ -153,7 +173,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       savedRoots: galleryStorageFolderCandidates(
         saveDirectory: settings.saveDirectory,
         bookmarkData: settings.saveDirectoryBookmarkData
-      )
+      ),
+      allowsMutation: { url, isSaved in
+        let currentPolicy = SettingsStore.shared.cleanupPolicy
+        guard currentPolicy == policy else { return false }
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let protected = WorkspaceStore.shared.cleanupActivePaths.contains {
+          URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path == path
+        }
+        let favorite = GalleryIndexStore.shared.entries.values.contains {
+          $0.favorite && URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path == path
+        }
+        return !protected && (!isSaved || !favorite)
+      }
     )
 
     for path in report.trashedSavedPaths {
@@ -269,14 +301,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
   
   @objc func showAboutAction(_ sender: Any?) {
-    NSApp.orderFrontStandardAboutPanel(nil)
+    PreferencesWindowController.shared.show(about: true)
   }
   
   // MARK: - Native Windows
   @MainActor
   func showGallery() {
     MainWindowNavigation.shared.showGallery()
-    focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+    focusMainWindow(preferredContentSize: CGSize(width: 1280, height: 800))
   }
   
   @MainActor
@@ -294,13 +326,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   func showQuickAction(forPath imagePath: String) {
     let item = ShotQueueStore.shared.enqueue(path: imagePath)
     MainWindowNavigation.shared.showQuickAction(itemID: item.id)
-    focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+    focusMainWindow(preferredContentSize: CGSize(width: 1280, height: 800))
   }
 
   @MainActor
   func openEditor(itemID: UUID) {
     MainWindowNavigation.shared.openEditor(itemID: itemID)
-    focusMainWindow(preferredContentSize: CGSize(width: 900, height: 650))
+    focusMainWindow(preferredContentSize: CGSize(width: 1280, height: 800))
   }
   
   @MainActor
@@ -315,19 +347,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       window = createdWindow
     }
     
-    let contentSize = window.contentView?.bounds.size ?? .zero
-    if contentSize.width < preferredContentSize.width ||
-        contentSize.height < preferredContentSize.height {
-      window.setContentSize(
-        CGSize(
-          width: max(contentSize.width, preferredContentSize.width),
-          height: max(contentSize.height, preferredContentSize.height)
-        )
-      )
-    }
-    
     window.delegate = self
     window.title = localized("app.name")
+    if let size = AppTestEnvironment.value("QPARK_TEST_WINDOW_SIZE") {
+      let dimensions = size.split(separator: "x").compactMap { Double($0) }
+      if dimensions.count == 2 {
+        // Apply the fixture size after SwiftUI has presented its split columns.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak window] in
+          guard let window else { return }
+          window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: dimensions[0], height: dimensions[1])), display: true)
+        }
+      }
+    }
     window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
@@ -355,6 +386,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     )
     window.isReleasedWhenClosed = false
     window.installRootContent()
+    if let visible = NSScreen.main?.visibleFrame {
+      var frame = window.frame
+      frame.size.width = min(frame.width, visible.width)
+      frame.size.height = min(frame.height, visible.height)
+      window.setFrame(frame, display: false)
+    }
     window.center()
     return window
   }
@@ -374,7 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       let req = CGRequestScreenCaptureAccess()
       writeDebugLog("Request screen capture access returned: \(req)")
       workspace.showPermissionRequired()
-      focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+      focusMainWindow(preferredContentSize: CGSize(width: 1280, height: 800))
 
       SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { _, _ in
         Task { @MainActor in
@@ -400,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let self else { return }
         guard let region else {
           WorkspaceStore.shared.isCapturing = false
+          WorkspaceStore.shared.presentStatus(localized("status.capture_cancelled"))
           self.restoreMainWindowIfNeeded(mainWindowWasVisible)
           return
         }
@@ -446,7 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .success(let url):
           WorkspaceStore.shared.isCapturing = false
           WorkspaceStore.shared.captured(path: url.path)
-          self.focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+          self.focusMainWindow(preferredContentSize: CGSize(width: 1280, height: 800))
         case .failure(let error):
           WorkspaceStore.shared.isCapturing = false
           self.writeDebugLog("Screencapture error: \(error)")
@@ -455,7 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.restoreMainWindowIfNeeded(restoreMainWindowOnCancel)
           } else {
             WorkspaceStore.shared.showError(localized("status.capture_failed"))
-            self.focusMainWindow(preferredContentSize: CGSize(width: 980, height: 660))
+            self.focusMainWindow(preferredContentSize: CGSize(width: 1280, height: 800))
           }
         }
       }
@@ -478,6 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   // MARK: - Carbon Global Hotkey Handling
   func syncHotkeySettings() {
     unregisterAllGlobalShortcuts()
+    guard !AppTestEnvironment.isEnabled else { return }
 
     let handlerStatus = ensureHotkeyEventHandlerInstalled()
     guard handlerStatus == noErr else { return }
